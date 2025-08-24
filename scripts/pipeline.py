@@ -7,7 +7,6 @@ import requests
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-import duckdb
 
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials as UserCredentials
@@ -242,13 +241,10 @@ def get_helper_maps() -> Tuple[Dict[str,str], Dict[str,str]]:
     for row in values:
         k = norm_key(row[0]) if len(row)>=1 else ""
         v_raw = row[1] if len(row)>=2 else ""
-        if k:
-            header_map[k] = v_raw  # B может быть с переносами — оставляем как есть
+        if k: header_map[k] = v_raw
         if len(row) >= 8:
-            url = norm_text(row[6])
-            ru  = norm_text(row[7])
-            if url and ru:
-                topic_ru_map[url] = ru
+            url = norm_text(row[6]); ru = norm_text(row[7])
+            if url and ru: topic_ru_map[url] = ru
     needed = ["relatedPlaylists.uploads","videoCount","topicCategories[]"]
     miss = [k for k in needed if norm_key(k) not in header_map]
     if miss: fail("HELPER_KEYS", f"missing keys in helper A:B: {','.join(miss)}")
@@ -272,7 +268,7 @@ def read_baza_columns(header_map: Dict[str,str]) -> Tuple[List[str], List[Option
     for k in [key_uploads, key_vcount, key_topics]:
         nk = norm_key(k)
         if nk not in norm_header_idx:
-            fail("HEADER_NOT_FOUND", f"'{k}' not found in Baza header (normalize spaces/newlines if needed)")
+            fail("HEADER_NOT_FOUND", f"'{k}' not found in Baza header")
     iu = norm_header_idx[norm_key(key_uploads)]
     iv = norm_header_idx[norm_key(key_vcount)]
     it = norm_header_idx[norm_key(key_topics)]
@@ -303,19 +299,13 @@ def over_10k_videos(vc: Optional[str]) -> bool:
     try: return int(re.sub(r"[^\d]","",vc)) > 10000
     except Exception: return False
 
-def key_rotate_if_needed():
-    global KEY_IDX
-    KEY_IDX += 1
-
 def list_playlist_video_ids_since(playlist_id: str, since_iso: str, stop_after: Optional[int]=None) -> List[Tuple[str,str]]:
     out=[]; page=None
     while True:
         if budget_left() < 1: break
-        js = yt_get("playlistItems",{
-            "part":"contentDetails","maxResults":50,"playlistId": playlist_id, **({"pageToken":page} if page else {})
-        }, cost_units=1)
-        items = js.get("items",[]); if_not = not items
-        if if_not: break
+        js = yt_get("playlistItems",{"part":"contentDetails","maxResults":50,"playlistId": playlist_id, **({"pageToken":page} if page else {})}, cost_units=1)
+        items = js.get("items",[])
+        if not items: break
         stop=False
         for it in items:
             vd = it["contentDetails"]["videoId"]
@@ -346,10 +336,7 @@ def fetch_videos(video_ids: List[str]) -> List[Dict]:
     for i in range(0,len(video_ids),50):
         if budget_left() < 1: break
         batch = ",".join(video_ids[i:i+50])
-        js = yt_get("videos",{
-            "part":"snippet,contentDetails,statistics,status,topicDetails,paidProductPlacementDetails",
-            "id": batch, "fields": FIELDS
-        }, cost_units=1)
+        js = yt_get("videos",{"part":"snippet,contentDetails,statistics,status,topicDetails,paidProductPlacementDetails","id": batch, "fields": FIELDS}, cost_units=1)
         for it in js.get("items",[]):
             sn = it.get("snippet",{}); cd = it.get("contentDetails",{})
             st = it.get("status",{}); stat = it.get("statistics",{})
@@ -387,8 +374,7 @@ def write_delta_records(records: List[Dict], playlist_id: str, topic_ru_map: Dic
     df["playlistId"] = playlist_id
     def map_topics(urls):
         if not isinstance(urls,list): return []
-        ru=[topic_ru_map[u] for u in urls if u in topic_ru_map]
-        return ru
+        return [topic_ru_map[u] for u in urls if u in topic_ru_map]
     df["topicCategories_ru"] = df["topicCategories"].apply(map_topics)
     df = df[~df["isShorts"].astype(bool)]
     if df.empty: return []
@@ -405,40 +391,29 @@ def write_delta_records(records: List[Dict], playlist_id: str, topic_ru_map: Dic
         written.append(dest)
     return written
 
-def upload_folder_recursive(local_root: str, drive_folder_id: str):
-    for root, _, files in os.walk(local_root):
-        for f in files:
-            full = os.path.join(root,f)
-            rel = os.path.relpath(full, local_root).replace(os.sep,"__")
-            name = f"{rel}"
-            try:
-                drive_upload(full, name, drive_folder_id)
-            except SystemExit:
-                raise
-            except Exception:
-                fail("DRIVE_UPLOAD", "upload failed")
-
 def compact_month(year: int, month: int):
     part_dir = os.path.join(LOCAL_OUT, f"year={year:04d}", f"month={month:02d}")
     if not os.path.isdir(part_dir): return None
-    files = [os.path.join(part_dir, f) for f in os.listdir(part_dir) if f.endswith(".parquet")]
+    files = [os.path.join(part_dir, f) for f in os.listdir(part_dir) if f.endswith(".parquet") and not f.endswith("_compact.parquet")]
     if not files: return None
-    con = duckdb.connect()
-    files_sql = ", ".join([f"read_parquet('{p}')" for p in files])
-    q = f"""
-    select * from (
-        select *, row_number() over (partition by videoId order by lastUpdatedAt desc) as rn
-        from ({files_sql})
-    ) where rn=1
-    """
-    df = con.execute(q).df(); con.close()
+    dfs=[]
+    for p in files:
+        try:
+            t = pq.read_table(p).to_pandas()
+            if not t.empty: dfs.append(t)
+        except Exception as e:
+            print(f"WARN[READ_PARQUET]: {p} {type(e).__name__} {str(e)[:120]}")
+    if not dfs: return None
+    df = pd.concat(dfs, ignore_index=True)
+    if "lastUpdatedAt" in df.columns:
+        df["lastUpdatedAt"] = pd.to_datetime(df["lastUpdatedAt"], utc=True, errors="coerce")
+        df = df.sort_values(["videoId","lastUpdatedAt"], ascending=[True, False])
+        df = df.drop_duplicates(subset=["videoId"], keep="first")
     compact_name = os.path.join(part_dir, f"videos_{year:04d}_{month:02d}_compact.parquet")
     pq.write_table(pa.Table.from_pandas(df, preserve_index=False), compact_name, compression="zstd")
     for p in files:
-        try:
-            if not p.endswith("_compact.parquet"): os.remove(p)
-        except Exception:
-            pass
+        try: os.remove(p)
+        except Exception: pass
     return compact_name
 
 def append_tombstones(rows: List[Dict]):
@@ -540,8 +515,10 @@ def main():
 
     for pid in allowed:
         if budget_left() < 2: break
-        try: lst = list_playlist_video_ids_since(pid, since_iso)
-        except Exception: fail("YOUTUBE_LIST", "playlistItems.list failed")
+        try:
+            lst = list_playlist_video_ids_since(pid, since_iso)
+        except Exception as e:
+            fail("YOUTUBE_LIST", f"playlistItems.list failed: {type(e).__name__} {str(e)[:200]}")
         if not lst:
             st = pl_state.get(pid, {}); st["last_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"; pl_state[pid] = st; continue
         last_seen = pl_state.get(pid,{}).get("last_seen_publishedAt")
@@ -549,8 +526,10 @@ def main():
         if not lst:
             st = pl_state.get(pid, {}); st["last_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"; pl_state[pid] = st; continue
         video_ids = [v for v,_ in lst]
-        try: recs = fetch_videos(video_ids)
-        except Exception: fail("YOUTUBE_VIDEOS", "videos.list failed")
+        try:
+            recs = fetch_videos(video_ids)
+        except Exception as e:
+            fail("YOUTUBE_VIDEOS", f"videos.list failed: {type(e).__name__} {str(e)[:200]}")
         write_delta_records(recs, pid, topic_ru_map)
         max_vpa = max([vpa for _,vpa in lst])
         st = pl_state.get(pid, {}); st["last_seen_publishedAt"] = max_vpa; st["last_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"; pl_state[pid] = st
@@ -560,8 +539,10 @@ def main():
 
     for pid in sorted(allowed, key=lambda x: pl_state.get(x,{}).get("last_update_scan_at") or "1970-01-01T00:00:00Z"):
         if budget_left() < 2: break
-        try: lst = list_playlist_video_ids_since(pid, since_iso)
-        except Exception: fail("YOUTUBE_LIST", "playlistItems.list failed")
+        try:
+            lst = list_playlist_video_ids_since(pid, since_iso)
+        except Exception as e:
+            fail("YOUTUBE_LIST", f"playlistItems.list failed: {type(e).__name__} {str(e)[:200]}")
         if not lst:
             st = pl_state.get(pid,{}); st["last_update_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"; pl_state[pid]=st; continue
         lst.sort(key=lambda tup: tup[1])
@@ -569,12 +550,13 @@ def main():
         for (vid, vpa) in lst:
             vids.append(vid)
             if len(vids)>=target_batches*50: break
-        try: recs = fetch_videos(vids)
-        except Exception: fail("YOUTUBE_VIDEOS", "videos.list failed")
+        try:
+            recs = fetch_videos(vids)
+        except Exception as e:
+            fail("YOUTUBE_VIDEOS", f"videos.list failed: {type(e).__name__} {str(e)[:200]}")
         write_delta_records(recs, pid, topic_ru_map)
         st = pl_state.get(pid,{}); st["last_update_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"; pl_state[pid]=st
 
-    need_gc = False
     last_gc = state.get("last_gc_at")
     last_gc_dt = dtparser.isoparse(last_gc) if last_gc else None
     need_gc = True if not last_gc_dt else (dt.datetime.utcnow() - last_gc_dt).days >= RESCAN_INTERVAL_DAYS
@@ -587,8 +569,10 @@ def main():
         for y,m in months:
             if (y,m) in seen: continue
             seen.add((y,m))
-            try: compact_month(int(y), int(m))
-            except Exception: fail("COMPACT", "month compaction failed")
+            try:
+                compact_month(int(y), int(m))
+            except Exception as e:
+                print(f"WARN[COMPACT_MM]: {y}-{m:02d} {type(e).__name__} {str(e)[:200]}")
         state["last_gc_at"] = dt.datetime.utcnow().isoformat()+"Z"
 
     state["playlists"] = pl_state
