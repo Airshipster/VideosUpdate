@@ -2,8 +2,8 @@ name: YouTube → Parquet (daily wave)
 
 on:
   schedule:
-    - cron: "0 9 * * *"     # 09:00 UTC = 13:00 
-  workflow_dispatch: {}      # ручной старт из GitHub UI
+    - cron: "0 9 * * *"
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -39,23 +39,15 @@ jobs:
 
       - name: Run pipeline
         env:
-          # --- YouTube & quotas ---
-          YOUTUBE_API_KEYS: ${{ secrets.YOUTUBE_API_KEYS }}     
-          DAILY_UNIT_BUDGET: ${{ secrets.DAILY_UNIT_BUDGET }}   
-
-          # --- Sheets (исходник и helper в ОДНОМ документе) ---
+          YOUTUBE_API_KEYS: ${{ secrets.YOUTUBE_API_KEYS }}
+          DAILY_UNIT_BUDGET: ${{ secrets.DAILY_UNIT_BUDGET }}
           SOURCE_SHEET_ID: ${{ secrets.SOURCE_SHEET_ID }}
-          SOURCE_SHEET_TAB: ${{ secrets.SOURCE_SHEET_TAB }}     
-          MAP_SHEET_TAB: ${{ secrets.MAP_SHEET_TAB }}           
-
-          # --- Drive target ---
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}       
-
-          # --- Scheduling & limits ---
-          RESCAN_INTERVAL_DAYS: ${{ secrets.RESCAN_INTERVAL_DAYS }} # 1
-          RUN_ANCHOR_LOCAL: ${{ secrets.RUN_ANCHOR_LOCAL }}         # "13.08.2025 13:00" (формат DD.MM.YYYY HH:MM)
-          RUN_TIME_LOCAL: ${{ secrets.RUN_TIME_LOCAL }}             # "13:00"
-          PLAYLIST_LIMIT: ${{ secrets.PLAYLIST_LIMIT }}             # "5" на тест
-
+          SOURCE_SHEET_TAB: ${{ secrets.SOURCE_SHEET_TAB }}
+          MAP_SHEET_TAB: ${{ secrets.MAP_SHEET_TAB }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          RESCAN_INTERVAL_DAYS: ${{ secrets.RESCAN_INTERVAL_DAYS }}
+          RUN_ANCHOR_LOCAL: ${{ secrets.RUN_ANCHOR_LOCAL }}
+          RUN_TIME_LOCAL: ${{ secrets.RUN_TIME_LOCAL }}
+          PLAYLIST_LIMIT: ${{ secrets.PLAYLIST_LIMIT }}
         run: |
           python scripts/pipeline.py
