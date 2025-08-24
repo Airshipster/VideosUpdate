@@ -60,60 +60,65 @@ def g_creds():
             "https://www.googleapis.com/auth/documents.readonly"
         ]
         return service_account.Credentials.from_service_account_file(path, scopes=scopes)
-    except Exception as e:
+    except Exception:
         fail("GCP_SA", "service account json not loaded")
+
+def build_svc(name, version):
+    try:
+        return build(name, version, credentials=g_creds(), cache_discovery=False)
+    except Exception:
+        fail("GOOGLE_SVC", f"{name} api init failed")
 
 def sheets_get_range(spreadsheet_id: str, rng: str):
     try:
-        svc = build("sheets", "v4", credentials=g_creds(), cache_discovery=False)
+        svc = build_svc("sheets","v4")
         return svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
-    except HttpError as e:
-        msg = f"{e.resp.status} {getattr(e, 'error_details', '')}".strip()
-        fail("SHEETS_ACCESS", f"range '{rng}' not readable; check SOURCE_SHEET_ID/MAP_SHEET_TAB/SOURCE_SHEET_TAB permissions or names")
-    except Exception as e:
-        fail("SHEETS_ACCESS", "unexpected error")
+    except HttpError:
+        fail("SHEETS_ACCESS", f"range '{rng}' not readable; check SOURCE_SHEET_ID/SOURCE_SHEET_TAB/MAP_SHEET_TAB")
+    except Exception:
+        fail("SHEETS_ACCESS", "unexpected")
 
 def drive_upload(filepath: str, name: str, folder_id: str):
     try:
-        svc = build("drive","v3", credentials=g_creds(), cache_discovery=False)
+        svc = build_svc("drive","v3")
         media = MediaFileUpload(filepath, resumable=True)
         file_meta = {"name": name, "parents": [folder_id]}
-        return svc.files().create(body=file_meta, media_body=media, fields="id").execute()["id"]
-    except HttpError as e:
+        return svc.files().create(body=file_meta, media_body=media, fields="id", supportsAllDrives=True).execute()["id"]
+    except HttpError:
         fail("DRIVE_UPLOAD", "cannot upload to DRIVE_FOLDER_ID (permissions or wrong folder id)")
-    except Exception as e:
-        fail("DRIVE_UPLOAD", "unexpected error")
+    except Exception:
+        fail("DRIVE_UPLOAD", "unexpected")
 
 def drive_find_one_by_name(name: str, folder_id: str) -> Optional[str]:
     try:
-        svc = build("drive","v3", credentials=g_creds(), cache_discovery=False)
+        svc = build_svc("drive","v3")
         q = f"'{folder_id}' in parents and name = '{name}' and trashed = false"
-        rsp = svc.files().list(q=q, spaces='drive', fields="files(id,name)", pageSize=1).execute()
+        rsp = svc.files().list(q=q, spaces='drive', fields="files(id,name)", pageSize=1, includeItemsFromAllDrives=True, supportsAllDrives=True).execute()
         files = rsp.get("files",[])
         return files[0]["id"] if files else None
-    except HttpError as e:
+    except HttpError:
         fail("DRIVE_ACCESS", "cannot list in DRIVE_FOLDER_ID (permissions or wrong folder id)")
-    except Exception as e:
-        fail("DRIVE_ACCESS", "unexpected error")
+    except Exception:
+        fail("DRIVE_ACCESS", "unexpected")
 
 def drive_download_to_file(file_id: str, dest_path: str):
     try:
-        svc = build("drive","v3", credentials=g_creds(), cache_discovery=False)
-        req = svc.files().get_media(fileId=file_id)
+        svc = build_svc("drive","v3")
+        req = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
         fh = io.FileIO(dest_path, 'wb')
         downloader = MediaIoBaseDownload(fh, req)
         done = False
         while not done:
             status, done = downloader.next_chunk()
-    except HttpError as e:
+    except HttpError:
         fail("DRIVE_READ", "cannot download state from DRIVE_FOLDER_ID")
-    except Exception as e:
-        fail("DRIVE_READ", "unexpected error")
+    except Exception:
+        fail("DRIVE_READ", "unexpected")
 
 def drive_delete(file_id: str):
     try:
-        svc = build("drive","v3", credentials=g_creds(), cache_discovery=False)
-        svc.files().delete(fileId=file_id).execute()
+        svc = build_svc("drive","v3")
+        svc.files().delete(fileId=file_id, supportsAllDrives=True).execute()
     except Exception:
         pass
 
@@ -462,6 +467,8 @@ def check_drive_probe():
     fid=None
     try:
         fid = drive_upload(p, os.path.basename(p), DRIVE_FOLDER_ID)
+    except SystemExit:
+        raise
     except Exception:
         fail("DRIVE_PROBE", "cannot write to DRIVE_FOLDER_ID")
     try:
@@ -541,7 +548,7 @@ def main():
             recs = fetch_videos(video_ids)
         except Exception:
             fail("YOUTUBE_VIDEOS", "videos.list failed")
-        written_paths = write_delta_records(recs, pid, topic_ru_map)
+        write_delta_records(recs, pid, topic_ru_map)
         max_vpa = max([vpa for _,vpa in lst])
         st = pl_state.get(pid, {})
         st["last_seen_publishedAt"] = max_vpa
@@ -597,7 +604,14 @@ def main():
     else:
         need_gc = (dt.datetime.utcnow() - last_gc_dt).days >= RESCAN_INTERVAL_DAYS
     if need_gc:
-        months = recent_months_list(WINDOW_MONTHS + BUFFER_MONTHS)
+        now = dt.datetime.utcnow()
+        months = []
+        y = now.year; m = now.month
+        for _ in range(WINDOW_MONTHS + BUFFER_MONTHS):
+            months.append((y,m))
+            m -= 1
+            if m==0:
+                m=12; y-=1
         seen=set()
         for y,m in months:
             if (y,m) in seen: continue
@@ -616,11 +630,15 @@ def main():
 
 if __name__ == "__main__":
     try:
-        if not API_KEYS: fail("MISSING_SECRET", "YOUTUBE_API_KEYS")
-        if not SOURCE_SHEET_ID or not SOURCE_SHEET_TAB or not MAP_SHEET_TAB: fail("MISSING_SECRET", "SOURCE_SHEET_ID/SOURCE_SHEET_TAB/MAP_SHEET_TAB")
-        if not DRIVE_FOLDER_ID: fail("MISSING_SECRET", "DRIVE_FOLDER_ID")
+        miss=[]
+        if not API_KEYS: miss.append("YOUTUBE_API_KEYS")
+        if not SOURCE_SHEET_ID: miss.append("SOURCE_SHEET_ID")
+        if not SOURCE_SHEET_TAB: miss.append("SOURCE_SHEET_TAB")
+        if not MAP_SHEET_TAB: miss.append("MAP_SHEET_TAB")
+        if not DRIVE_FOLDER_ID: miss.append("DRIVE_FOLDER_ID")
+        if miss: fail("MISSING_SECRET", ",".join(miss))
         main()
-    except SystemExit as e:
+    except SystemExit:
         raise
     except Exception as e:
         t = type(e).__name__
