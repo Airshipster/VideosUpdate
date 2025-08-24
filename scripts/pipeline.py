@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 import duckdb
 
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from googleapiclient.errors import HttpError
@@ -25,6 +26,10 @@ RESCAN_INTERVAL_DAYS = int(os.getenv("RESCAN_INTERVAL_DAYS","1") or "1")
 RUN_ANCHOR_LOCAL = os.getenv("RUN_ANCHOR_LOCAL","").strip()
 RUN_TIME_LOCAL = os.getenv("RUN_TIME_LOCAL","13:00").strip()
 PLAYLIST_LIMIT = int(os.getenv("PLAYLIST_LIMIT","0") or "0")
+
+DRIVE_OAUTH_CLIENT_ID = os.getenv("DRIVE_OAUTH_CLIENT_ID","").strip()
+DRIVE_OAUTH_CLIENT_SECRET = os.getenv("DRIVE_OAUTH_CLIENT_SECRET","").strip()
+DRIVE_OAUTH_REFRESH_TOKEN = os.getenv("DRIVE_OAUTH_REFRESH_TOKEN","").strip()
 
 BAKU_TZ = tz.gettz("Asia/Baku")
 YOUTUBE_ENDPOINT = "https://www.googleapis.com/youtube/v3"
@@ -50,24 +55,44 @@ def fail(code: str, detail: str, exit_code: int = 2):
     print(f"ERROR[{code}]: {detail}")
     sys.exit(exit_code)
 
-def g_creds():
+def g_sa_creds():
     try:
         path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
         scopes = [
-            "https://www.googleapis.com/auth/drive.file",
-            "https://www.googleapis.com/auth/drive.readonly",
-            "https://www.googleapis.com/auth/spreadsheets.readonly",
-            "https://www.googleapis.com/auth/documents.readonly"
+            "https://www.googleapis.com/auth/spreadsheets.readonly"
         ]
         return service_account.Credentials.from_service_account_file(path, scopes=scopes)
     except Exception:
         fail("GCP_SA", "service account json not loaded")
 
-def build_svc(name, version):
+def g_user_creds():
     try:
-        return build(name, version, credentials=g_creds(), cache_discovery=False)
+        if not (DRIVE_OAUTH_CLIENT_ID and DRIVE_OAUTH_CLIENT_SECRET and DRIVE_OAUTH_REFRESH_TOKEN):
+            fail("MISSING_SECRET", "DRIVE_OAUTH_CLIENT_ID/DRIVE_OAUTH_CLIENT_SECRET/DRIVE_OAUTH_REFRESH_TOKEN")
+        scopes = ["https://www.googleapis.com/auth/drive"]
+        creds = UserCredentials(
+            token=None,
+            refresh_token=DRIVE_OAUTH_REFRESH_TOKEN,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=DRIVE_OAUTH_CLIENT_ID,
+            client_secret=DRIVE_OAUTH_CLIENT_SECRET,
+            scopes=scopes,
+        )
+        return creds
     except Exception:
-        fail("GOOGLE_SVC", f"{name} api init failed")
+        fail("DRIVE_OAUTH", "user oauth creds build failed")
+
+def build_sheets():
+    try:
+        return build("sheets", "v4", credentials=g_sa_creds(), cache_discovery=False)
+    except Exception:
+        fail("GOOGLE_SHEETS", "init failed")
+
+def build_drive():
+    try:
+        return build("drive", "v3", credentials=g_user_creds(), cache_discovery=False)
+    except Exception:
+        fail("GOOGLE_DRIVE", "init failed")
 
 def parse_http_error(e: HttpError) -> Tuple[Optional[int], str]:
     try:
@@ -90,7 +115,7 @@ def parse_http_error(e: HttpError) -> Tuple[Optional[int], str]:
 
 def sheets_get_range(spreadsheet_id: str, rng: str):
     try:
-        svc = build_svc("sheets","v4")
+        svc = build_sheets()
         return svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
     except HttpError as e:
         status, msg = parse_http_error(e)
@@ -100,7 +125,7 @@ def sheets_get_range(spreadsheet_id: str, rng: str):
 
 def drive_meta(file_id: str) -> Dict:
     try:
-        svc = build_svc("drive","v3")
+        svc = build_drive()
         return svc.files().get(fileId=file_id, fields="id,name,mimeType,driveId", supportsAllDrives=True).execute()
     except HttpError as e:
         status, msg = parse_http_error(e)
@@ -112,7 +137,7 @@ def drive_meta(file_id: str) -> Dict:
 
 def drive_upload(filepath: str, name: str, folder_id: str):
     try:
-        svc = build_svc("drive","v3")
+        svc = build_drive()
         media = MediaFileUpload(filepath, resumable=True)
         file_meta = {"name": name, "parents": [folder_id]}
         return svc.files().create(body=file_meta, media_body=media, fields="id", supportsAllDrives=True).execute()["id"]
@@ -128,7 +153,7 @@ def drive_upload(filepath: str, name: str, folder_id: str):
 
 def drive_find_one_by_name(name: str, folder_id: str) -> Optional[str]:
     try:
-        svc = build_svc("drive","v3")
+        svc = build_drive()
         q = f"'{folder_id}' in parents and name = '{name}' and trashed = false"
         rsp = svc.files().list(q=q, spaces='drive', fields="files(id,name)", pageSize=1, includeItemsFromAllDrives=True, supportsAllDrives=True).execute()
         files = rsp.get("files",[])
@@ -145,7 +170,7 @@ def drive_find_one_by_name(name: str, folder_id: str) -> Optional[str]:
 
 def drive_download_to_file(file_id: str, dest_path: str):
     try:
-        svc = build_svc("drive","v3")
+        svc = build_drive()
         req = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
         fh = io.FileIO(dest_path, 'wb')
         downloader = MediaIoBaseDownload(fh, req)
@@ -162,7 +187,7 @@ def drive_download_to_file(file_id: str, dest_path: str):
 
 def drive_delete(file_id: str):
     try:
-        svc = build_svc("drive","v3")
+        svc = build_drive()
         svc.files().delete(fileId=file_id, supportsAllDrives=True).execute()
     except Exception:
         pass
@@ -506,6 +531,9 @@ def check_secrets():
     if not SOURCE_SHEET_TAB: miss.append("SOURCE_SHEET_TAB")
     if not MAP_SHEET_TAB: miss.append("MAP_SHEET_TAB")
     if not DRIVE_FOLDER_ID: miss.append("DRIVE_FOLDER_ID")
+    if not DRIVE_OAUTH_CLIENT_ID: miss.append("DRIVE_OAUTH_CLIENT_ID")
+    if not DRIVE_OAUTH_CLIENT_SECRET: miss.append("DRIVE_OAUTH_CLIENT_SECRET")
+    if not DRIVE_OAUTH_REFRESH_TOKEN: miss.append("DRIVE_OAUTH_REFRESH_TOKEN")
     if miss: fail("MISSING_SECRET", ",".join(miss))
 
 def check_drive_probe():
@@ -520,7 +548,7 @@ def check_drive_probe():
         fid = drive_upload(p, os.path.basename(p), DRIVE_FOLDER_ID)
     except SystemExit:
         raise
-    except Exception as e:
+    except Exception:
         fail("DRIVE_PROBE", "cannot write to DRIVE_FOLDER_ID")
     try:
         if fid: drive_delete(fid)
@@ -687,6 +715,9 @@ if __name__ == "__main__":
         if not SOURCE_SHEET_TAB: miss.append("SOURCE_SHEET_TAB")
         if not MAP_SHEET_TAB: miss.append("MAP_SHEET_TAB")
         if not DRIVE_FOLDER_ID: miss.append("DRIVE_FOLDER_ID")
+        if not DRIVE_OAUTH_CLIENT_ID: miss.append("DRIVE_OAUTH_CLIENT_ID")
+        if not DRIVE_OAUTH_CLIENT_SECRET: miss.append("DRIVE_OAUTH_CLIENT_SECRET")
+        if not DRIVE_OAUTH_REFRESH_TOKEN: miss.append("DRIVE_OAUTH_REFRESH_TOKEN")
         if miss: fail("MISSING_SECRET", ",".join(miss))
         main()
     except SystemExit:
