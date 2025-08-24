@@ -69,14 +69,46 @@ def build_svc(name, version):
     except Exception:
         fail("GOOGLE_SVC", f"{name} api init failed")
 
+def parse_http_error(e: HttpError) -> Tuple[Optional[int], str]:
+    try:
+        status = getattr(e.resp, "status", None)
+    except Exception:
+        status = None
+    msg = ""
+    try:
+        if hasattr(e, "content") and e.content:
+            c = e.content
+            if isinstance(c, bytes):
+                c = c.decode("utf-8", "ignore")
+            j = json.loads(c)
+            msg = j.get("error", {}).get("message", "") or c[:200]
+        else:
+            msg = str(e)
+    except Exception:
+        msg = str(e)[:200]
+    return status, msg
+
 def sheets_get_range(spreadsheet_id: str, rng: str):
     try:
         svc = build_svc("sheets","v4")
         return svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
-    except HttpError:
-        fail("SHEETS_ACCESS", f"range '{rng}' not readable; check SOURCE_SHEET_ID/SOURCE_SHEET_TAB/MAP_SHEET_TAB")
+    except HttpError as e:
+        status, msg = parse_http_error(e)
+        fail("SHEETS_ACCESS", f"{status} {rng} {msg}")
     except Exception:
         fail("SHEETS_ACCESS", "unexpected")
+
+def drive_meta(file_id: str) -> Dict:
+    try:
+        svc = build_svc("drive","v3")
+        return svc.files().get(fileId=file_id, fields="id,name,mimeType,driveId", supportsAllDrives=True).execute()
+    except HttpError as e:
+        status, msg = parse_http_error(e)
+        if status == 404:
+            fail("DRIVE_ID_NOT_FOUND", f"id={file_id}")
+        fail("DRIVE_META", f"{status} {msg}")
+    except Exception:
+        fail("DRIVE_META", "unexpected")
 
 def drive_upload(filepath: str, name: str, folder_id: str):
     try:
@@ -84,8 +116,13 @@ def drive_upload(filepath: str, name: str, folder_id: str):
         media = MediaFileUpload(filepath, resumable=True)
         file_meta = {"name": name, "parents": [folder_id]}
         return svc.files().create(body=file_meta, media_body=media, fields="id", supportsAllDrives=True).execute()["id"]
-    except HttpError:
-        fail("DRIVE_UPLOAD", "cannot upload to DRIVE_FOLDER_ID (permissions or wrong folder id)")
+    except HttpError as e:
+        status, msg = parse_http_error(e)
+        if status == 404:
+            fail("DRIVE_ID_NOT_FOUND", f"id={folder_id}")
+        if status == 403:
+            fail("DRIVE_FORBIDDEN", msg or "forbidden")
+        fail("DRIVE_UPLOAD", f"{status} {msg}")
     except Exception:
         fail("DRIVE_UPLOAD", "unexpected")
 
@@ -96,8 +133,13 @@ def drive_find_one_by_name(name: str, folder_id: str) -> Optional[str]:
         rsp = svc.files().list(q=q, spaces='drive', fields="files(id,name)", pageSize=1, includeItemsFromAllDrives=True, supportsAllDrives=True).execute()
         files = rsp.get("files",[])
         return files[0]["id"] if files else None
-    except HttpError:
-        fail("DRIVE_ACCESS", "cannot list in DRIVE_FOLDER_ID (permissions or wrong folder id)")
+    except HttpError as e:
+        status, msg = parse_http_error(e)
+        if status == 404:
+            fail("DRIVE_ID_NOT_FOUND", f"id={folder_id}")
+        if status == 403:
+            fail("DRIVE_FORBIDDEN", msg or "forbidden")
+        fail("DRIVE_ACCESS", f"{status} {msg}")
     except Exception:
         fail("DRIVE_ACCESS", "unexpected")
 
@@ -110,8 +152,11 @@ def drive_download_to_file(file_id: str, dest_path: str):
         done = False
         while not done:
             status, done = downloader.next_chunk()
-    except HttpError:
-        fail("DRIVE_READ", "cannot download state from DRIVE_FOLDER_ID")
+    except HttpError as e:
+        status, msg = parse_http_error(e)
+        if status == 404:
+            fail("DRIVE_STATE_NOT_FOUND", "state.json not found")
+        fail("DRIVE_READ", f"{status} {msg}")
     except Exception:
         fail("DRIVE_READ", "unexpected")
 
@@ -400,6 +445,8 @@ def upload_folder_recursive(local_root: str, drive_folder_id: str):
             name = f"{rel}"
             try:
                 drive_upload(full, name, drive_folder_id)
+            except SystemExit:
+                raise
             except Exception:
                 fail("DRIVE_UPLOAD", "upload failed")
 
@@ -462,6 +509,10 @@ def check_secrets():
     if miss: fail("MISSING_SECRET", ",".join(miss))
 
 def check_drive_probe():
+    meta = drive_meta(DRIVE_FOLDER_ID)
+    mt = meta.get("mimeType","")
+    if mt != "application/vnd.google-apps.folder":
+        fail("DRIVE_ID_NOT_FOLDER", f"id={DRIVE_FOLDER_ID} mimeType={mt}")
     p = os.path.join(LOCAL_TMP, f"probe_{int(time.time())}.txt")
     with open(p,"w",encoding="utf-8") as f: f.write("ok")
     fid=None
@@ -469,7 +520,7 @@ def check_drive_probe():
         fid = drive_upload(p, os.path.basename(p), DRIVE_FOLDER_ID)
     except SystemExit:
         raise
-    except Exception:
+    except Exception as e:
         fail("DRIVE_PROBE", "cannot write to DRIVE_FOLDER_ID")
     try:
         if fid: drive_delete(fid)
