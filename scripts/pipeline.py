@@ -9,11 +9,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import duckdb
 
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.errors import HttpError
+
 API_KEYS_RAW = os.getenv("YOUTUBE_API_KEYS","").strip()
 API_KEYS = [x.strip() for x in API_KEYS_RAW.splitlines() if x.strip()]
-if not API_KEYS:
-    sys.exit(1)
-
 DAILY_UNIT_BUDGET = int(os.getenv("DAILY_UNIT_BUDGET","9500") or "9500")
 SOURCE_SHEET_ID = os.getenv("SOURCE_SHEET_ID","").strip()
 SOURCE_SHEET_TAB = os.getenv("SOURCE_SHEET_TAB","").strip()
@@ -44,67 +46,85 @@ BUFFER_MONTHS = 2
 os.makedirs(LOCAL_OUT, exist_ok=True)
 os.makedirs(LOCAL_TMP, exist_ok=True)
 
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+def fail(code: str, detail: str, exit_code: int = 2):
+    print(f"ERROR[{code}]: {detail}")
+    sys.exit(exit_code)
 
 def g_creds():
-    path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
-    scopes = [
-        "https://www.googleapis.com/auth/drive.file",
-        "https://www.googleapis.com/auth/drive.readonly",
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-        "https://www.googleapis.com/auth/documents.readonly"
-    ]
-    return service_account.Credentials.from_service_account_file(path, scopes=scopes)
+    try:
+        path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+        scopes = [
+            "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
+            "https://www.googleapis.com/auth/documents.readonly"
+        ]
+        return service_account.Credentials.from_service_account_file(path, scopes=scopes)
+    except Exception as e:
+        fail("GCP_SA", "service account json not loaded")
 
 def sheets_get_range(spreadsheet_id: str, rng: str):
-    svc = build("sheets", "v4", credentials=g_creds())
-    return svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
+    try:
+        svc = build("sheets", "v4", credentials=g_creds(), cache_discovery=False)
+        return svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
+    except HttpError as e:
+        msg = f"{e.resp.status} {getattr(e, 'error_details', '')}".strip()
+        fail("SHEETS_ACCESS", f"range '{rng}' not readable; check SOURCE_SHEET_ID/MAP_SHEET_TAB/SOURCE_SHEET_TAB permissions or names")
+    except Exception as e:
+        fail("SHEETS_ACCESS", "unexpected error")
 
 def drive_upload(filepath: str, name: str, folder_id: str):
-    svc = build("drive","v3", credentials=g_creds())
-    media = MediaFileUpload(filepath, resumable=True)
-    file_meta = {"name": name, "parents": [folder_id]}
-    return svc.files().create(body=file_meta, media_body=media, fields="id").execute()["id"]
+    try:
+        svc = build("drive","v3", credentials=g_creds(), cache_discovery=False)
+        media = MediaFileUpload(filepath, resumable=True)
+        file_meta = {"name": name, "parents": [folder_id]}
+        return svc.files().create(body=file_meta, media_body=media, fields="id").execute()["id"]
+    except HttpError as e:
+        fail("DRIVE_UPLOAD", "cannot upload to DRIVE_FOLDER_ID (permissions or wrong folder id)")
+    except Exception as e:
+        fail("DRIVE_UPLOAD", "unexpected error")
 
 def drive_find_one_by_name(name: str, folder_id: str) -> Optional[str]:
-    svc = build("drive","v3", credentials=g_creds())
-    q = f"'{folder_id}' in parents and name = '{name}' and trashed = false"
-    rsp = svc.files().list(q=q, spaces='drive', fields="files(id,name)", pageSize=1).execute()
-    files = rsp.get("files",[])
-    return files[0]["id"] if files else None
+    try:
+        svc = build("drive","v3", credentials=g_creds(), cache_discovery=False)
+        q = f"'{folder_id}' in parents and name = '{name}' and trashed = false"
+        rsp = svc.files().list(q=q, spaces='drive', fields="files(id,name)", pageSize=1).execute()
+        files = rsp.get("files",[])
+        return files[0]["id"] if files else None
+    except HttpError as e:
+        fail("DRIVE_ACCESS", "cannot list in DRIVE_FOLDER_ID (permissions or wrong folder id)")
+    except Exception as e:
+        fail("DRIVE_ACCESS", "unexpected error")
 
 def drive_download_to_file(file_id: str, dest_path: str):
-    svc = build("drive","v3", credentials=g_creds())
-    req = svc.files().get_media(fileId=file_id)
-    fh = io.FileIO(dest_path, 'wb')
-    downloader = MediaIoBaseDownload(fh, req)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
+    try:
+        svc = build("drive","v3", credentials=g_creds(), cache_discovery=False)
+        req = svc.files().get_media(fileId=file_id)
+        fh = io.FileIO(dest_path, 'wb')
+        downloader = MediaIoBaseDownload(fh, req)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+    except HttpError as e:
+        fail("DRIVE_READ", "cannot download state from DRIVE_FOLDER_ID")
+    except Exception as e:
+        fail("DRIVE_READ", "unexpected error")
+
+def drive_delete(file_id: str):
+    try:
+        svc = build("drive","v3", credentials=g_creds(), cache_discovery=False)
+        svc.files().delete(fileId=file_id).execute()
+    except Exception:
+        pass
 
 def drive_overwrite(name: str, folder_id: str, local_path: str):
-    svc = build("drive","v3", credentials=g_creds())
     old_id = drive_find_one_by_name(name, folder_id)
     if old_id:
         try:
-            svc.files().delete(fileId=old_id).execute()
+            drive_delete(old_id)
         except Exception:
             pass
     return drive_upload(local_path, name, folder_id)
-
-def drive_list_prefix(prefix: str, folder_id: str) -> List[Tuple[str,str]]:
-    svc = build("drive","v3", credentials=g_creds())
-    q = f"'{folder_id}' in parents and name contains '{prefix}' and trashed = false"
-    items=[]
-    pageToken=None
-    while True:
-        rsp = svc.files().list(q=q, spaces="drive", fields="nextPageToken,files(id,name)", pageSize=1000, pageToken=pageToken).execute()
-        items += [(f["id"], f["name"]) for f in rsp.get("files",[])]
-        pageToken = rsp.get("nextPageToken")
-        if not pageToken: break
-    return items
 
 def obf(s: str) -> str:
     if not s: return ""
@@ -127,20 +147,24 @@ def budget_left() -> int:
 def yt_get(path, params, cost_units=1):
     global UNITS_USED
     if budget_left() < cost_units:
-        raise RuntimeError("quota")
+        fail("QUOTA", "daily unit budget reached")
     for attempt in range(6):
-        params2 = dict(params)
-        params2["key"] = key()
-        r = SESSION.get(f"{YOUTUBE_ENDPOINT}/{path}", params=params2, timeout=30)
-        if r.status_code == 200:
-            UNITS_USED += cost_units
-            return r.json()
-        if r.status_code in (403, 429, 503):
-            rotate_key()
+        try:
+            params2 = dict(params)
+            params2["key"] = key()
+            r = SESSION.get(f"{YOUTUBE_ENDPOINT}/{path}", params=params2, timeout=30)
+            if r.status_code == 200:
+                UNITS_USED += cost_units
+                return r.json()
+            if r.status_code in (403, 429, 503):
+                rotate_key()
+                time.sleep(min(60, 2**attempt))
+                continue
+            r.raise_for_status()
+        except requests.RequestException:
             time.sleep(min(60, 2**attempt))
             continue
-        r.raise_for_status()
-    raise RuntimeError("yt")
+    fail("YOUTUBE_API", f"{path} request failed")
 
 def iso8601_to_seconds(s: str) -> Optional[int]:
     if not s: return None
@@ -157,8 +181,11 @@ def load_state() -> Dict:
         return {"last_gc_at": None, "playlists": {}}
     dest = os.path.join(LOCAL_TMP, STATE_NAME)
     drive_download_to_file(fid, dest)
-    with open(dest,"r",encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(dest,"r",encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        fail("STATE_PARSE", "state.json invalid")
 
 def save_state(st: Dict):
     tmp = os.path.join(LOCAL_TMP, STATE_NAME)
@@ -170,6 +197,8 @@ def get_helper_maps() -> Tuple[Dict[str,str], Dict[str,str]]:
     rng = f"{MAP_SHEET_TAB}!A:H"
     rs = sheets_get_range(SOURCE_SHEET_ID, rng)
     values = rs.get("values", [])
+    if not values:
+        fail("HELPER_EMPTY", "helper sheet has no data")
     header_map = {}
     topic_ru_map = {}
     for row in values:
@@ -183,6 +212,10 @@ def get_helper_maps() -> Tuple[Dict[str,str], Dict[str,str]]:
             ru  = row[7].strip() if len(row)>7 else ""
             if url and ru:
                 topic_ru_map[url] = ru
+    needed = ["relatedPlaylists.uploads","videoCount","topicCategories[]"]
+    miss = [k for k in needed if k not in header_map]
+    if miss:
+        fail("HELPER_KEYS", f"missing keys in helper A:B: {','.join(miss)}")
     return header_map, topic_ru_map
 
 def column_index_to_letter(i: int) -> str:
@@ -196,21 +229,27 @@ def column_index_to_letter(i: int) -> str:
 def read_baza_columns(header_map: Dict[str,str]) -> Tuple[List[str], List[Optional[str]], List[str]]:
     rs = sheets_get_range(SOURCE_SHEET_ID, f"{SOURCE_SHEET_TAB}!1:1")
     header = rs.get("values", [[]])[0]
+    if not header:
+        fail("BAZA_EMPTY", "baza header row is empty")
     key_uploads = header_map.get("relatedPlaylists.uploads","relatedPlaylists.uploads")
     key_vcount  = header_map.get("videoCount","videoCount")
     key_topics  = header_map.get("topicCategories[]","topicCategories[]")
     norm = {h.lower().strip():i for i,h in enumerate(header)}
-    if key_uploads.lower().strip() not in norm or key_vcount.lower().strip() not in norm or key_topics.lower().strip() not in norm:
-        return [],[],[]
+    for k in [key_uploads, key_vcount, key_topics]:
+        if k.lower().strip() not in norm:
+            fail("HEADER_NOT_FOUND", f"'{k}' not found in Baza header")
     iu = norm[key_uploads.lower().strip()]
     iv = norm[key_vcount.lower().strip()]
     it = norm[key_topics.lower().strip()]
     lu = column_index_to_letter(iu)
     lv = column_index_to_letter(iv)
     lt = column_index_to_letter(it)
-    col_u = sheets_get_range(SOURCE_SHEET_ID, f"{SOURCE_SHEET_TAB}!{lu}2:{lu}").get("values",[])
-    col_v = sheets_get_range(SOURCE_SHEET_ID, f"{SOURCE_SHEET_TAB}!{lv}2:{lv}").get("values",[])
-    col_t = sheets_get_range(SOURCE_SHEET_ID, f"{SOURCE_SHEET_TAB}!{lt}2:{lt}").get("values",[])
+    try:
+        col_u = sheets_get_range(SOURCE_SHEET_ID, f"{SOURCE_SHEET_TAB}!{lu}2:{lu}").get("values",[])
+        col_v = sheets_get_range(SOURCE_SHEET_ID, f"{SOURCE_SHEET_TAB}!{lv}2:{lv}").get("values",[])
+        col_t = sheets_get_range(SOURCE_SHEET_ID, f"{SOURCE_SHEET_TAB}!{lt}2:{lt}").get("values",[])
+    except Exception:
+        fail("SHEETS_READ", "failed reading Baza columns")
     n = max(len(col_u), len(col_v), len(col_t))
     uploads=[]; vcounts=[]; topics=[]
     for i in range(n):
@@ -251,7 +290,7 @@ def list_playlist_video_ids_since(playlist_id: str, since_iso: str, stop_after: 
         for it in items:
             vd = it["contentDetails"]["videoId"]
             vpa = it["contentDetails"].get("videoPublishedAt")
-            if not vpa: 
+            if not vpa:
                 continue
             if vpa >= since_iso:
                 out.append((vd, vpa))
@@ -357,7 +396,7 @@ def upload_folder_recursive(local_root: str, drive_folder_id: str):
             try:
                 drive_upload(full, name, drive_folder_id)
             except Exception:
-                pass
+                fail("DRIVE_UPLOAD", "upload failed")
 
 def compact_month(year: int, month: int):
     part_dir = os.path.join(LOCAL_OUT, f"year={year:04d}", f"month={month:02d}")
@@ -408,13 +447,39 @@ def recent_months_list(n: int):
             y -= 1
     return out
 
+def check_secrets():
+    miss=[]
+    if not API_KEYS: miss.append("YOUTUBE_API_KEYS")
+    if not SOURCE_SHEET_ID: miss.append("SOURCE_SHEET_ID")
+    if not SOURCE_SHEET_TAB: miss.append("SOURCE_SHEET_TAB")
+    if not MAP_SHEET_TAB: miss.append("MAP_SHEET_TAB")
+    if not DRIVE_FOLDER_ID: miss.append("DRIVE_FOLDER_ID")
+    if miss: fail("MISSING_SECRET", ",".join(miss))
+
+def check_drive_probe():
+    p = os.path.join(LOCAL_TMP, f"probe_{int(time.time())}.txt")
+    with open(p,"w",encoding="utf-8") as f: f.write("ok")
+    fid=None
+    try:
+        fid = drive_upload(p, os.path.basename(p), DRIVE_FOLDER_ID)
+    except Exception:
+        fail("DRIVE_PROBE", "cannot write to DRIVE_FOLDER_ID")
+    try:
+        if fid: drive_delete(fid)
+    except Exception:
+        pass
+
 def main():
-    global UNITS_USED
+    check_secrets()
+    check_drive_probe()
+
     now_utc = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
     since = now_utc - dt.timedelta(days=WINDOW_DAYS)
     since_iso = since.isoformat().replace("+00:00","Z")
+
     header_map, topic_ru_map = get_helper_maps()
     uploads, vcounts, topics = read_baza_columns(header_map)
+
     allowed=[]
     for pid, vc, tc in zip(uploads, vcounts, topics):
         if not pid: continue
@@ -425,9 +490,11 @@ def main():
         allowed.append(pid)
     if PLAYLIST_LIMIT and PLAYLIST_LIMIT>0:
         allowed = allowed[:PLAYLIST_LIMIT]
+
     state = load_state()
     if "playlists" not in state: state["playlists"] = {}
     pl_state = state["playlists"]
+
     prev_pids = set(pl_state.keys())
     curr_pids = set(allowed)
     removed = list(prev_pids - curr_pids)
@@ -444,14 +511,18 @@ def main():
         pl_state[rp]=st
     if trows:
         append_tombstones(trows)
+
     for pid in allowed:
         st = pl_state.get(pid, {})
         st["present"] = True
         pl_state[pid] = st
-    new_written=0
+
     for pid in allowed:
         if budget_left() < 2: break
-        lst = list_playlist_video_ids_since(pid, since_iso)
+        try:
+            lst = list_playlist_video_ids_since(pid, since_iso)
+        except Exception:
+            fail("YOUTUBE_LIST", "playlistItems.list failed")
         if not lst: 
             st = pl_state.get(pid, {})
             st["last_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"
@@ -466,25 +537,31 @@ def main():
             pl_state[pid] = st
             continue
         video_ids = [v for v,_ in lst]
-        recs = fetch_videos(video_ids)
+        try:
+            recs = fetch_videos(video_ids)
+        except Exception:
+            fail("YOUTUBE_VIDEOS", "videos.list failed")
         written_paths = write_delta_records(recs, pid, topic_ru_map)
-        if written_paths:
-            new_written += len(written_paths)
         max_vpa = max([vpa for _,vpa in lst])
         st = pl_state.get(pid, {})
         st["last_seen_publishedAt"] = max_vpa
         st["last_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"
         pl_state[pid] = st
         if budget_left() < 2: break
+
     append_tombstones([{
         "videoId": None,
         "playlistId": None,
         "tombstoneReason": "out_of_window",
         "tombstonedAt": dt.datetime.utcnow().isoformat()+"Z"
     }])
+
     for pid in sorted(allowed, key=lambda x: pl_state.get(x,{}).get("last_update_scan_at") or "1970-01-01T00:00:00Z"):
         if budget_left() < 2: break
-        lst = list_playlist_video_ids_since(pid, since_iso)
+        try:
+            lst = list_playlist_video_ids_since(pid, since_iso)
+        except Exception:
+            fail("YOUTUBE_LIST", "playlistItems.list failed")
         if not lst:
             st = pl_state.get(pid,{})
             st["last_update_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"
@@ -497,11 +574,15 @@ def main():
             vids.append(vid)
             if len(vids)>=target_batches*50:
                 break
-        recs = fetch_videos(vids)
+        try:
+            recs = fetch_videos(vids)
+        except Exception:
+            fail("YOUTUBE_VIDEOS", "videos.list failed")
         write_delta_records(recs, pid, topic_ru_map)
         st = pl_state.get(pid,{})
         st["last_update_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"
         pl_state[pid]=st
+
     need_gc = False
     last_gc = state.get("last_gc_at")
     if last_gc:
@@ -524,8 +605,9 @@ def main():
             try:
                 compact_month(int(y), int(m))
             except Exception:
-                pass
+                fail("COMPACT", "month compaction failed")
         state["last_gc_at"] = dt.datetime.utcnow().isoformat()+"Z"
+
     state["playlists"] = pl_state
     save_state(state)
     upload_folder_recursive(LOCAL_OUT, DRIVE_FOLDER_ID)
@@ -534,7 +616,14 @@ def main():
 
 if __name__ == "__main__":
     try:
+        if not API_KEYS: fail("MISSING_SECRET", "YOUTUBE_API_KEYS")
+        if not SOURCE_SHEET_ID or not SOURCE_SHEET_TAB or not MAP_SHEET_TAB: fail("MISSING_SECRET", "SOURCE_SHEET_ID/SOURCE_SHEET_TAB/MAP_SHEET_TAB")
+        if not DRIVE_FOLDER_ID: fail("MISSING_SECRET", "DRIVE_FOLDER_ID")
         main()
-    except Exception:
-        print("error")
-        sys.exit(1)
+    except SystemExit as e:
+        raise
+    except Exception as e:
+        t = type(e).__name__
+        msg = str(e)[:200] if str(e) else ""
+        print(f"ERROR[UNHANDLED]: {t} {msg}")
+        sys.exit(3)
