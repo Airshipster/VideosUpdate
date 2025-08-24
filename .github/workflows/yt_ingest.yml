@@ -36,6 +36,7 @@ jobs:
         run: |
           echo "${GCP_SA_JSON}" > sa.json
           echo "GOOGLE_APPLICATION_CREDENTIALS=$GITHUB_WORKSPACE/sa.json" >> $GITHUB_ENV
+          echo "PYTHONUNBUFFERED=1" >> $GITHUB_ENV
 
       - name: Run pipeline
         env:
