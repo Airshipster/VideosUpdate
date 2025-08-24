@@ -40,7 +40,7 @@ jobs:
 
       - name: Sanity check secrets
         run: |
-          req=(GCP_SA_JSON YOUTUBE_API_KEYS DAILY_UNIT_BUDGET SOURCE_SHEET_ID SOURCE_SHEET_TAB MAP_SHEET_TAB DRIVE_FOLDER_ID RESCAN_INTERVAL_DAYS RUN_ANCHOR_LOCAL RUN_TIME_LOCAL PLAYLIST_LIMIT)
+          req=(GCP_SA_JSON YOUTUBE_API_KEYS DAILY_UNIT_BUDGET SOURCE_SHEET_ID SOURCE_SHEET_TAB MAP_SHEET_TAB DRIVE_FOLDER_ID RESCAN_INTERVAL_DAYS RUN_ANCHOR_LOCAL RUN_TIME_LOCAL PLAYLIST_LIMIT DRIVE_OAUTH_CLIENT_ID DRIVE_OAUTH_CLIENT_SECRET DRIVE_OAUTH_REFRESH_TOKEN)
           missing=()
           for k in "${req[@]}"; do
             v="${!k}"
@@ -62,6 +62,9 @@ jobs:
           RUN_ANCHOR_LOCAL: ${{ secrets.RUN_ANCHOR_LOCAL }}
           RUN_TIME_LOCAL: ${{ secrets.RUN_TIME_LOCAL }}
           PLAYLIST_LIMIT: ${{ secrets.PLAYLIST_LIMIT }}
+          DRIVE_OAUTH_CLIENT_ID: ${{ secrets.DRIVE_OAUTH_CLIENT_ID }}
+          DRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.DRIVE_OAUTH_CLIENT_SECRET }}
+          DRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.DRIVE_OAUTH_REFRESH_TOKEN }}
 
       - name: Run pipeline
         env:
@@ -75,5 +78,8 @@ jobs:
           RUN_ANCHOR_LOCAL: ${{ secrets.RUN_ANCHOR_LOCAL }}
           RUN_TIME_LOCAL: ${{ secrets.RUN_TIME_LOCAL }}
           PLAYLIST_LIMIT: ${{ secrets.PLAYLIST_LIMIT }}
+          DRIVE_OAUTH_CLIENT_ID: ${{ secrets.DRIVE_OAUTH_CLIENT_ID }}
+          DRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.DRIVE_OAUTH_CLIENT_SECRET }}
+          DRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.DRIVE_OAUTH_REFRESH_TOKEN }}
         run: |
           python scripts/pipeline.py
