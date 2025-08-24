@@ -55,12 +55,25 @@ def fail(code: str, detail: str, exit_code: int = 2):
     print(f"ERROR[{code}]: {detail}")
     sys.exit(exit_code)
 
+def norm_text(s: str) -> str:
+    if s is None: return ""
+    s = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", str(s))
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+def norm_key(s: str) -> str:
+    return norm_text(s).lower()
+
+def a1(sheet: str, rng: str) -> str:
+    sh = sheet
+    if not (sh.startswith("'") and sh.endswith("'")):
+        sh = f"'{sh}'"
+    return f"{sh}!{rng}"
+
 def g_sa_creds():
     try:
         path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets.readonly"
-        ]
+        scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
         return service_account.Credentials.from_service_account_file(path, scopes=scopes)
     except Exception:
         fail("GCP_SA", "service account json not loaded")
@@ -70,7 +83,7 @@ def g_user_creds():
         if not (DRIVE_OAUTH_CLIENT_ID and DRIVE_OAUTH_CLIENT_SECRET and DRIVE_OAUTH_REFRESH_TOKEN):
             fail("MISSING_SECRET", "DRIVE_OAUTH_CLIENT_ID/DRIVE_OAUTH_CLIENT_SECRET/DRIVE_OAUTH_REFRESH_TOKEN")
         scopes = ["https://www.googleapis.com/auth/drive"]
-        creds = UserCredentials(
+        return UserCredentials(
             token=None,
             refresh_token=DRIVE_OAUTH_REFRESH_TOKEN,
             token_uri="https://oauth2.googleapis.com/token",
@@ -78,7 +91,6 @@ def g_user_creds():
             client_secret=DRIVE_OAUTH_CLIENT_SECRET,
             scopes=scopes,
         )
-        return creds
     except Exception:
         fail("DRIVE_OAUTH", "user oauth creds build failed")
 
@@ -95,20 +107,13 @@ def build_drive():
         fail("GOOGLE_DRIVE", "init failed")
 
 def parse_http_error(e: HttpError) -> Tuple[Optional[int], str]:
-    try:
-        status = getattr(e.resp, "status", None)
-    except Exception:
-        status = None
+    try: status = getattr(e.resp, "status", None)
+    except Exception: status = None
     msg = ""
     try:
-        if hasattr(e, "content") and e.content:
-            c = e.content
-            if isinstance(c, bytes):
-                c = c.decode("utf-8", "ignore")
-            j = json.loads(c)
-            msg = j.get("error", {}).get("message", "") or c[:200]
-        else:
-            msg = str(e)
+        c = e.content.decode("utf-8", "ignore") if isinstance(e.content, bytes) else (e.content or "")
+        j = json.loads(c) if c else {}
+        msg = j.get("error", {}).get("message", "") or (str(e)[:200] if str(e) else "")
     except Exception:
         msg = str(e)[:200]
     return status, msg
@@ -129,8 +134,7 @@ def drive_meta(file_id: str) -> Dict:
         return svc.files().get(fileId=file_id, fields="id,name,mimeType,driveId", supportsAllDrives=True).execute()
     except HttpError as e:
         status, msg = parse_http_error(e)
-        if status == 404:
-            fail("DRIVE_ID_NOT_FOUND", f"id={file_id}")
+        if status == 404: fail("DRIVE_ID_NOT_FOUND", f"id={file_id}")
         fail("DRIVE_META", f"{status} {msg}")
     except Exception:
         fail("DRIVE_META", "unexpected")
@@ -143,10 +147,8 @@ def drive_upload(filepath: str, name: str, folder_id: str):
         return svc.files().create(body=file_meta, media_body=media, fields="id", supportsAllDrives=True).execute()["id"]
     except HttpError as e:
         status, msg = parse_http_error(e)
-        if status == 404:
-            fail("DRIVE_ID_NOT_FOUND", f"id={folder_id}")
-        if status == 403:
-            fail("DRIVE_FORBIDDEN", msg or "forbidden")
+        if status == 404: fail("DRIVE_ID_NOT_FOUND", f"id={folder_id}")
+        if status == 403: fail("DRIVE_FORBIDDEN", msg or "forbidden")
         fail("DRIVE_UPLOAD", f"{status} {msg}")
     except Exception:
         fail("DRIVE_UPLOAD", "unexpected")
@@ -160,10 +162,8 @@ def drive_find_one_by_name(name: str, folder_id: str) -> Optional[str]:
         return files[0]["id"] if files else None
     except HttpError as e:
         status, msg = parse_http_error(e)
-        if status == 404:
-            fail("DRIVE_ID_NOT_FOUND", f"id={folder_id}")
-        if status == 403:
-            fail("DRIVE_FORBIDDEN", msg or "forbidden")
+        if status == 404: fail("DRIVE_ID_NOT_FOUND", f"id={folder_id}")
+        if status == 403: fail("DRIVE_FORBIDDEN", msg or "forbidden")
         fail("DRIVE_ACCESS", f"{status} {msg}")
     except Exception:
         fail("DRIVE_ACCESS", "unexpected")
@@ -179,8 +179,7 @@ def drive_download_to_file(file_id: str, dest_path: str):
             status, done = downloader.next_chunk()
     except HttpError as e:
         status, msg = parse_http_error(e)
-        if status == 404:
-            fail("DRIVE_STATE_NOT_FOUND", "state.json not found")
+        if status == 404: fail("DRIVE_STATE_NOT_FOUND", "state.json not found")
         fail("DRIVE_READ", f"{status} {msg}")
     except Exception:
         fail("DRIVE_READ", "unexpected")
@@ -195,18 +194,9 @@ def drive_delete(file_id: str):
 def drive_overwrite(name: str, folder_id: str, local_path: str):
     old_id = drive_find_one_by_name(name, folder_id)
     if old_id:
-        try:
-            drive_delete(old_id)
-        except Exception:
-            pass
+        try: drive_delete(old_id)
+        except Exception: pass
     return drive_upload(local_path, name, folder_id)
-
-def obf(s: str) -> str:
-    if not s: return ""
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:8]
-
-def log(msg: str):
-    print(f"[{dt.datetime.utcnow().isoformat()}Z] {msg}")
 
 def key() -> str:
     global KEY_IDX
@@ -221,173 +211,134 @@ def budget_left() -> int:
 
 def yt_get(path, params, cost_units=1):
     global UNITS_USED
-    if budget_left() < cost_units:
-        fail("QUOTA", "daily unit budget reached")
+    if budget_left() < cost_units: fail("QUOTA", "daily unit budget reached")
     for attempt in range(6):
         try:
-            params2 = dict(params)
-            params2["key"] = key()
-            r = SESSION.get(f"{YOUTUBE_ENDPOINT}/{path}", params=params2, timeout=30)
+            p = dict(params); p["key"] = key()
+            r = SESSION.get(f"{YOUTUBE_ENDPOINT}/{path}", params=p, timeout=30)
             if r.status_code == 200:
                 UNITS_USED += cost_units
                 return r.json()
-            if r.status_code in (403, 429, 503):
-                rotate_key()
-                time.sleep(min(60, 2**attempt))
-                continue
+            if r.status_code in (403,429,503):
+                rotate_key(); time.sleep(min(60, 2**attempt)); continue
             r.raise_for_status()
         except requests.RequestException:
-            time.sleep(min(60, 2**attempt))
-            continue
+            time.sleep(min(60, 2**attempt)); continue
     fail("YOUTUBE_API", f"{path} request failed")
 
 def iso8601_to_seconds(s: str) -> Optional[int]:
     if not s: return None
     m = re.fullmatch(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', s)
     if not m: return None
-    h = int(m.group(1) or 0)
-    mnt = int(m.group(2) or 0)
-    sec = int(m.group(3) or 0)
+    h = int(m.group(1) or 0); mnt = int(m.group(2) or 0); sec = int(m.group(3) or 0)
     return h*3600 + mnt*60 + sec
 
-def load_state() -> Dict:
-    fid = drive_find_one_by_name(STATE_NAME, DRIVE_FOLDER_ID)
-    if not fid:
-        return {"last_gc_at": None, "playlists": {}}
-    dest = os.path.join(LOCAL_TMP, STATE_NAME)
-    drive_download_to_file(fid, dest)
-    try:
-        with open(dest,"r",encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        fail("STATE_PARSE", "state.json invalid")
-
-def save_state(st: Dict):
-    tmp = os.path.join(LOCAL_TMP, STATE_NAME)
-    with open(tmp,"w",encoding="utf-8") as f:
-        json.dump(st, f, ensure_ascii=False, indent=2)
-    drive_overwrite(STATE_NAME, DRIVE_FOLDER_ID, tmp)
-
 def get_helper_maps() -> Tuple[Dict[str,str], Dict[str,str]]:
-    rng = f"{MAP_SHEET_TAB}!A:H"
-    rs = sheets_get_range(SOURCE_SHEET_ID, rng)
+    rs = sheets_get_range(SOURCE_SHEET_ID, a1(MAP_SHEET_TAB, "A:H"))
     values = rs.get("values", [])
-    if not values:
-        fail("HELPER_EMPTY", "helper sheet has no data")
+    if not values: fail("HELPER_EMPTY", "helper sheet has no data")
     header_map = {}
     topic_ru_map = {}
     for row in values:
-        if len(row) >= 2 and row[0] and row[1]:
-            k = row[0].strip()
-            v = row[1].strip()
-            if k and v:
-                header_map[k] = v
+        k = norm_key(row[0]) if len(row)>=1 else ""
+        v_raw = row[1] if len(row)>=2 else ""
+        if k:
+            header_map[k] = v_raw  # B может быть с переносами — оставляем как есть
         if len(row) >= 8:
-            url = row[6].strip() if len(row)>6 else ""
-            ru  = row[7].strip() if len(row)>7 else ""
+            url = norm_text(row[6])
+            ru  = norm_text(row[7])
             if url and ru:
                 topic_ru_map[url] = ru
     needed = ["relatedPlaylists.uploads","videoCount","topicCategories[]"]
-    miss = [k for k in needed if k not in header_map]
-    if miss:
-        fail("HELPER_KEYS", f"missing keys in helper A:B: {','.join(miss)}")
+    miss = [k for k in needed if norm_key(k) not in header_map]
+    if miss: fail("HELPER_KEYS", f"missing keys in helper A:B: {','.join(miss)}")
     return header_map, topic_ru_map
 
 def column_index_to_letter(i: int) -> str:
-    s = ""
-    i += 1
+    s = ""; i += 1
     while i > 0:
-        i, r = divmod(i-1, 26)
-        s = chr(65+r) + s
+        i, r = divmod(i-1, 26); s = chr(65+r) + s
     return s
 
 def read_baza_columns(header_map: Dict[str,str]) -> Tuple[List[str], List[Optional[str]], List[str]]:
-    rs = sheets_get_range(SOURCE_SHEET_ID, f"{SOURCE_SHEET_TAB}!1:1")
+    rs = sheets_get_range(SOURCE_SHEET_ID, a1(SOURCE_SHEET_TAB, "1:1"))
     header = rs.get("values", [[]])[0]
-    if not header:
-        fail("BAZA_EMPTY", "baza header row is empty")
-    key_uploads = header_map.get("relatedPlaylists.uploads","relatedPlaylists.uploads")
-    key_vcount  = header_map.get("videoCount","videoCount")
-    key_topics  = header_map.get("topicCategories[]","topicCategories[]")
-    norm = {h.lower().strip():i for i,h in enumerate(header)}
+    if not header: fail("BAZA_EMPTY", "baza header row is empty")
+    def H(s): return norm_key(s)
+    key_uploads = header_map[H("relatedPlaylists.uploads")]
+    key_vcount  = header_map[H("videoCount")]
+    key_topics  = header_map[H("topicCategories[]")]
+    norm_header_idx = {norm_key(h): i for i,h in enumerate(header)}
     for k in [key_uploads, key_vcount, key_topics]:
-        if k.lower().strip() not in norm:
-            fail("HEADER_NOT_FOUND", f"'{k}' not found in Baza header")
-    iu = norm[key_uploads.lower().strip()]
-    iv = norm[key_vcount.lower().strip()]
-    it = norm[key_topics.lower().strip()]
-    lu = column_index_to_letter(iu)
-    lv = column_index_to_letter(iv)
-    lt = column_index_to_letter(it)
+        nk = norm_key(k)
+        if nk not in norm_header_idx:
+            fail("HEADER_NOT_FOUND", f"'{k}' not found in Baza header (normalize spaces/newlines if needed)")
+    iu = norm_header_idx[norm_key(key_uploads)]
+    iv = norm_header_idx[norm_key(key_vcount)]
+    it = norm_header_idx[norm_key(key_topics)]
+    lu = column_index_to_letter(iu); lv = column_index_to_letter(iv); lt = column_index_to_letter(it)
     try:
-        col_u = sheets_get_range(SOURCE_SHEET_ID, f"{SOURCE_SHEET_TAB}!{lu}2:{lu}").get("values",[])
-        col_v = sheets_get_range(SOURCE_SHEET_ID, f"{SOURCE_SHEET_TAB}!{lv}2:{lv}").get("values",[])
-        col_t = sheets_get_range(SOURCE_SHEET_ID, f"{SOURCE_SHEET_TAB}!{lt}2:{lt}").get("values",[])
+        col_u = sheets_get_range(SOURCE_SHEET_ID, a1(SOURCE_SHEET_TAB, f"{lu}2:{lu}")).get("values",[])
+        col_v = sheets_get_range(SOURCE_SHEET_ID, a1(SOURCE_SHEET_TAB, f"{lv}2:{lv}")).get("values",[])
+        col_t = sheets_get_range(SOURCE_SHEET_ID, a1(SOURCE_SHEET_TAB, f"{lt}2:{lt}")).get("values",[])
     except Exception:
         fail("SHEETS_READ", "failed reading Baza columns")
     n = max(len(col_u), len(col_v), len(col_t))
     uploads=[]; vcounts=[]; topics=[]
     for i in range(n):
-        u = col_u[i][0].strip() if i<len(col_u) and col_u[i] else ""
+        u = norm_text(col_u[i][0]) if i<len(col_u) and col_u[i] else ""
         pid = u.split()[0] if u else ""
         uploads.append(pid if pid else "")
-        vc = col_v[i][0].strip() if i<len(col_v) and col_v[i] else ""
+        vc = norm_text(col_v[i][0]) if i<len(col_v) and col_v[i] else ""
         vcounts.append(vc if vc else None)
-        tc = col_t[i][0].strip() if i<len(col_t) and col_t[i] else ""
+        tc = norm_text(col_t[i][0]) if i<len(col_t) and col_t[i] else ""
         topics.append(tc)
     return uploads, vcounts, topics
 
 def is_tv_channel(topic_cell_text: str) -> bool:
-    if not topic_cell_text: return False
-    return "телевизионные программы" in topic_cell_text.lower()
+    return "телевизионные программы" in norm_key(topic_cell_text)
 
 def over_10k_videos(vc: Optional[str]) -> bool:
     if not vc: return False
-    try:
-        return int(re.sub(r"[^\d]","",vc)) > 10000
-    except Exception:
-        return False
+    try: return int(re.sub(r"[^\d]","",vc)) > 10000
+    except Exception: return False
+
+def key_rotate_if_needed():
+    global KEY_IDX
+    KEY_IDX += 1
 
 def list_playlist_video_ids_since(playlist_id: str, since_iso: str, stop_after: Optional[int]=None) -> List[Tuple[str,str]]:
-    out=[]
-    page=None
+    out=[]; page=None
     while True:
         if budget_left() < 1: break
         js = yt_get("playlistItems",{
-            "part":"contentDetails",
-            "maxResults":50,
-            "playlistId": playlist_id,
-            **({"pageToken":page} if page else {})
+            "part":"contentDetails","maxResults":50,"playlistId": playlist_id, **({"pageToken":page} if page else {})
         }, cost_units=1)
-        items = js.get("items",[])
-        if not items: break
-        stop_here=False
+        items = js.get("items",[]); if_not = not items
+        if if_not: break
+        stop=False
         for it in items:
             vd = it["contentDetails"]["videoId"]
             vpa = it["contentDetails"].get("videoPublishedAt")
-            if not vpa:
-                continue
+            if not vpa: continue
             if vpa >= since_iso:
                 out.append((vd, vpa))
-                if stop_after and len(out)>=stop_after:
-                    return out
+                if stop_after and len(out)>=stop_after: return out
             else:
-                stop_here=True
-        if stop_here: break
+                stop=True
+        if stop: break
         page = js.get("nextPageToken")
         if not page: break
     return out
 
 FIELDS = ",".join([
-  "items("
-  "id,"
+  "items(id,"
   "snippet(publishedAt,title,tags,categoryId,defaultLanguage,defaultAudioLanguage),"
   "contentDetails(duration,licensedContent),"
   "status(madeForKids,selfDeclaredMadeForKids),"
   "statistics(viewCount,likeCount,commentCount),"
   "topicDetails(topicCategories),"
-  "paidProductPlacementDetails(hasPaidProductPlacement)"
-  ")"
+  "paidProductPlacementDetails(hasPaidProductPlacement))"
 ])
 
 def fetch_videos(video_ids: List[str]) -> List[Dict]:
@@ -397,16 +348,12 @@ def fetch_videos(video_ids: List[str]) -> List[Dict]:
         batch = ",".join(video_ids[i:i+50])
         js = yt_get("videos",{
             "part":"snippet,contentDetails,statistics,status,topicDetails,paidProductPlacementDetails",
-            "id": batch,
-            "fields": FIELDS
+            "id": batch, "fields": FIELDS
         }, cost_units=1)
         for it in js.get("items",[]):
-            sn = it.get("snippet",{})
-            cd = it.get("contentDetails",{})
-            st = it.get("status",{})
-            stat = it.get("statistics",{})
-            td = it.get("topicDetails",{})
-            pp = it.get("paidProductPlacementDetails",{})
+            sn = it.get("snippet",{}); cd = it.get("contentDetails",{})
+            st = it.get("status",{}); stat = it.get("statistics",{})
+            td = it.get("topicDetails",{}); pp = it.get("paidProductPlacementDetails",{})
             dur_sec = iso8601_to_seconds(cd.get("duration"))
             rec = {
               "videoId": it.get("id"),
@@ -440,10 +387,7 @@ def write_delta_records(records: List[Dict], playlist_id: str, topic_ru_map: Dic
     df["playlistId"] = playlist_id
     def map_topics(urls):
         if not isinstance(urls,list): return []
-        ru=[]
-        for u in urls:
-            if u in topic_ru_map:
-                ru.append(topic_ru_map[u])
+        ru=[topic_ru_map[u] for u in urls if u in topic_ru_map]
         return ru
     df["topicCategories_ru"] = df["topicCategories"].apply(map_topics)
     df = df[~df["isShorts"].astype(bool)]
@@ -457,8 +401,7 @@ def write_delta_records(records: List[Dict], playlist_id: str, topic_ru_map: Dic
         os.makedirs(part_dir, exist_ok=True)
         fname = f"{DELTA_PREFIX}_{y:04d}_{m:02d}_{int(time.time())}.parquet"
         dest = os.path.join(part_dir, fname)
-        table = pa.Table.from_pandas(part, preserve_index=False)
-        pq.write_table(table, dest, compression="zstd")
+        pq.write_table(pa.Table.from_pandas(part, preserve_index=False), dest, compression="zstd")
         written.append(dest)
     return written
 
@@ -477,27 +420,23 @@ def upload_folder_recursive(local_root: str, drive_folder_id: str):
 
 def compact_month(year: int, month: int):
     part_dir = os.path.join(LOCAL_OUT, f"year={year:04d}", f"month={month:02d}")
-    if not os.path.isdir(part_dir):
-        return None
+    if not os.path.isdir(part_dir): return None
     files = [os.path.join(part_dir, f) for f in os.listdir(part_dir) if f.endswith(".parquet")]
     if not files: return None
     con = duckdb.connect()
     files_sql = ", ".join([f"read_parquet('{p}')" for p in files])
     q = f"""
     select * from (
-        select *,
-               row_number() over (partition by videoId order by lastUpdatedAt desc) as rn
+        select *, row_number() over (partition by videoId order by lastUpdatedAt desc) as rn
         from ({files_sql})
     ) where rn=1
     """
-    df = con.execute(q).df()
-    con.close()
+    df = con.execute(q).df(); con.close()
     compact_name = os.path.join(part_dir, f"videos_{year:04d}_{month:02d}_compact.parquet")
     pq.write_table(pa.Table.from_pandas(df, preserve_index=False), compact_name, compression="zstd")
     for p in files:
         try:
-            if not p.endswith("_compact.parquet"):
-                os.remove(p)
+            if not p.endswith("_compact.parquet"): os.remove(p)
         except Exception:
             pass
     return compact_name
@@ -512,16 +451,10 @@ def append_tombstones(rows: List[Dict]):
     pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path, compression="zstd")
 
 def recent_months_list(n: int):
-    now = dt.datetime.utcnow()
-    y = now.year
-    m = now.month
-    out=[]
+    now = dt.datetime.utcnow(); y = now.year; m = now.month; out=[]
     for _ in range(n):
-        out.append((y,m))
-        m -= 1
-        if m == 0:
-            m = 12
-            y -= 1
+        out.append((y,m)); m -= 1
+        if m == 0: m = 12; y -= 1
     return out
 
 def check_secrets():
@@ -555,6 +488,21 @@ def check_drive_probe():
     except Exception:
         pass
 
+def load_state() -> Dict:
+    fid = drive_find_one_by_name(STATE_NAME, DRIVE_FOLDER_ID)
+    if not fid: return {"last_gc_at": None, "playlists": {}}
+    dest = os.path.join(LOCAL_TMP, STATE_NAME)
+    drive_download_to_file(fid, dest)
+    try:
+        with open(dest,"r",encoding="utf-8") as f: return json.load(f)
+    except Exception:
+        fail("STATE_PARSE", "state.json invalid")
+
+def save_state(st: Dict):
+    tmp = os.path.join(LOCAL_TMP, STATE_NAME)
+    with open(tmp,"w",encoding="utf-8") as f: json.dump(st, f, ensure_ascii=False, indent=2)
+    drive_overwrite(STATE_NAME, DRIVE_FOLDER_ID, tmp)
+
 def main():
     check_secrets()
     check_drive_probe()
@@ -569,10 +517,8 @@ def main():
     allowed=[]
     for pid, vc, tc in zip(uploads, vcounts, topics):
         if not pid: continue
-        if over_10k_videos(vc): 
-            continue
-        if is_tv_channel(tc):
-            continue
+        if over_10k_videos(vc): continue
+        if is_tv_channel(tc): continue
         allowed.append(pid)
     if PLAYLIST_LIMIT and PLAYLIST_LIMIT>0:
         allowed = allowed[:PLAYLIST_LIMIT]
@@ -581,131 +527,79 @@ def main():
     if "playlists" not in state: state["playlists"] = {}
     pl_state = state["playlists"]
 
-    prev_pids = set(pl_state.keys())
-    curr_pids = set(allowed)
+    prev_pids = set(pl_state.keys()); curr_pids = set(allowed)
     removed = list(prev_pids - curr_pids)
     trows=[]
     for rp in removed:
-        trows.append({
-            "videoId": None,
-            "playlistId": rp,
-            "tombstoneReason": "playlist_removed",
-            "tombstonedAt": dt.datetime.utcnow().isoformat()+"Z"
-        })
-        st = pl_state.get(rp,{})
-        st["present"] = False
-        pl_state[rp]=st
-    if trows:
-        append_tombstones(trows)
+        trows.append({"videoId": None,"playlistId": rp,"tombstoneReason": "playlist_removed","tombstonedAt": dt.datetime.utcnow().isoformat()+"Z"})
+        st = pl_state.get(rp,{}); st["present"] = False; pl_state[rp]=st
+    if trows: append_tombstones(trows)
 
     for pid in allowed:
-        st = pl_state.get(pid, {})
-        st["present"] = True
-        pl_state[pid] = st
+        st = pl_state.get(pid, {}); st["present"] = True; pl_state[pid] = st
 
     for pid in allowed:
         if budget_left() < 2: break
-        try:
-            lst = list_playlist_video_ids_since(pid, since_iso)
-        except Exception:
-            fail("YOUTUBE_LIST", "playlistItems.list failed")
-        if not lst: 
-            st = pl_state.get(pid, {})
-            st["last_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"
-            pl_state[pid] = st
-            continue
-        last_seen = pl_state.get(pid,{}).get("last_seen_publishedAt")
-        if last_seen:
-            lst = [x for x in lst if x[1] > last_seen]
+        try: lst = list_playlist_video_ids_since(pid, since_iso)
+        except Exception: fail("YOUTUBE_LIST", "playlistItems.list failed")
         if not lst:
-            st = pl_state.get(pid, {})
-            st["last_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"
-            pl_state[pid] = st
-            continue
+            st = pl_state.get(pid, {}); st["last_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"; pl_state[pid] = st; continue
+        last_seen = pl_state.get(pid,{}).get("last_seen_publishedAt")
+        if last_seen: lst = [x for x in lst if x[1] > last_seen]
+        if not lst:
+            st = pl_state.get(pid, {}); st["last_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"; pl_state[pid] = st; continue
         video_ids = [v for v,_ in lst]
-        try:
-            recs = fetch_videos(video_ids)
-        except Exception:
-            fail("YOUTUBE_VIDEOS", "videos.list failed")
+        try: recs = fetch_videos(video_ids)
+        except Exception: fail("YOUTUBE_VIDEOS", "videos.list failed")
         write_delta_records(recs, pid, topic_ru_map)
         max_vpa = max([vpa for _,vpa in lst])
-        st = pl_state.get(pid, {})
-        st["last_seen_publishedAt"] = max_vpa
-        st["last_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"
-        pl_state[pid] = st
+        st = pl_state.get(pid, {}); st["last_seen_publishedAt"] = max_vpa; st["last_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"; pl_state[pid] = st
         if budget_left() < 2: break
 
-    append_tombstones([{
-        "videoId": None,
-        "playlistId": None,
-        "tombstoneReason": "out_of_window",
-        "tombstonedAt": dt.datetime.utcnow().isoformat()+"Z"
-    }])
+    append_tombstones([{"videoId": None,"playlistId": None,"tombstoneReason": "out_of_window","tombstonedAt": dt.datetime.utcnow().isoformat()+"Z"}])
 
     for pid in sorted(allowed, key=lambda x: pl_state.get(x,{}).get("last_update_scan_at") or "1970-01-01T00:00:00Z"):
         if budget_left() < 2: break
-        try:
-            lst = list_playlist_video_ids_since(pid, since_iso)
-        except Exception:
-            fail("YOUTUBE_LIST", "playlistItems.list failed")
+        try: lst = list_playlist_video_ids_since(pid, since_iso)
+        except Exception: fail("YOUTUBE_LIST", "playlistItems.list failed")
         if not lst:
-            st = pl_state.get(pid,{})
-            st["last_update_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"
-            pl_state[pid]=st
-            continue
+            st = pl_state.get(pid,{}); st["last_update_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"; pl_state[pid]=st; continue
         lst.sort(key=lambda tup: tup[1])
-        vids=[]
-        target_batches = max(1, min(10, budget_left()//2))
+        vids=[]; target_batches = max(1, min(10, budget_left()//2))
         for (vid, vpa) in lst:
             vids.append(vid)
-            if len(vids)>=target_batches*50:
-                break
-        try:
-            recs = fetch_videos(vids)
-        except Exception:
-            fail("YOUTUBE_VIDEOS", "videos.list failed")
+            if len(vids)>=target_batches*50: break
+        try: recs = fetch_videos(vids)
+        except Exception: fail("YOUTUBE_VIDEOS", "videos.list failed")
         write_delta_records(recs, pid, topic_ru_map)
-        st = pl_state.get(pid,{})
-        st["last_update_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"
-        pl_state[pid]=st
+        st = pl_state.get(pid,{}); st["last_update_scan_at"] = dt.datetime.utcnow().isoformat()+"Z"; pl_state[pid]=st
 
     need_gc = False
     last_gc = state.get("last_gc_at")
-    if last_gc:
-        try:
-            last_gc_dt = dtparser.isoparse(last_gc)
-        except Exception:
-            last_gc_dt = None
-    else:
-        last_gc_dt = None
-    if not last_gc_dt:
-        need_gc = True
-    else:
-        need_gc = (dt.datetime.utcnow() - last_gc_dt).days >= RESCAN_INTERVAL_DAYS
+    last_gc_dt = dtparser.isoparse(last_gc) if last_gc else None
+    need_gc = True if not last_gc_dt else (dt.datetime.utcnow() - last_gc_dt).days >= RESCAN_INTERVAL_DAYS
     if need_gc:
-        now = dt.datetime.utcnow()
-        months = []
-        y = now.year; m = now.month
+        now = dt.datetime.utcnow(); months = []; y = now.year; m = now.month
         for _ in range(WINDOW_MONTHS + BUFFER_MONTHS):
-            months.append((y,m))
-            m -= 1
-            if m==0:
-                m=12; y-=1
+            months.append((y,m)); m -= 1
+            if m==0: m=12; y-=1
         seen=set()
         for y,m in months:
             if (y,m) in seen: continue
             seen.add((y,m))
-            try:
-                compact_month(int(y), int(m))
-            except Exception:
-                fail("COMPACT", "month compaction failed")
+            try: compact_month(int(y), int(m))
+            except Exception: fail("COMPACT", "month compaction failed")
         state["last_gc_at"] = dt.datetime.utcnow().isoformat()+"Z"
 
     state["playlists"] = pl_state
-    save_state(state)
-    upload_folder_recursive(LOCAL_OUT, DRIVE_FOLDER_ID)
-    log(f"audit: quota≈{UNITS_USED}, daily_budget={DAILY_UNIT_BUDGET}")
-    log("finish")
+    tmp = os.path.join(LOCAL_TMP, STATE_NAME)
+    with open(tmp,"w",encoding="utf-8") as f: json.dump(state, f, ensure_ascii=False, indent=2)
+    drive_overwrite(STATE_NAME, DRIVE_FOLDER_ID, tmp)
+    for root, _, files in os.walk(LOCAL_OUT):
+        for f in files:
+            full = os.path.join(root,f)
+            rel = os.path.relpath(full, LOCAL_OUT).replace(os.sep,"__")
+            drive_upload(full, rel, DRIVE_FOLDER_ID)
 
 if __name__ == "__main__":
     try:
@@ -723,7 +617,6 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:
-        t = type(e).__name__
-        msg = str(e)[:200] if str(e) else ""
+        t = type(e).__name__; msg = (str(e) or "")[:200]
         print(f"ERROR[UNHANDLED]: {t} {msg}")
         sys.exit(3)
