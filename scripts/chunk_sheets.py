@@ -19,6 +19,7 @@ ROWS_PER_DOC=int(os.getenv("ROWS_PER_DOC","20000") or "20000")
 DRIVE_OAUTH_CLIENT_ID=os.getenv("DRIVE_OAUTH_CLIENT_ID","").strip()
 DRIVE_OAUTH_CLIENT_SECRET=os.getenv("DRIVE_OAUTH_CLIENT_SECRET","").strip()
 DRIVE_OAUTH_REFRESH_TOKEN=os.getenv("DRIVE_OAUTH_REFRESH_TOKEN","").strip()
+
 BAKU_TZ=tz.gettz("Asia/Baku")
 WINDOW_DAYS=365
 SHORTS_LIMIT=182
@@ -26,23 +27,25 @@ SESSION=requests.Session()
 YOUTUBE_ENDPOINT="https://www.googleapis.com/youtube/v3"
 KEY_IDX=0
 
+SCOPES_USER=["https://www.googleapis.com/auth/drive","https://www.googleapis.com/auth/spreadsheets"]
+
 def fail(code,msg,ec=2):
     print(f"ERROR[{code}]: {msg}")
     sys.exit(ec)
 
-def user_creds(scopes):
+def user_creds():
     if not (DRIVE_OAUTH_CLIENT_ID and DRIVE_OAUTH_CLIENT_SECRET and DRIVE_OAUTH_REFRESH_TOKEN):
         fail("MISSING_OAUTH","drive oauth secrets missing")
-    return UserCreds(token=None,refresh_token=DRIVE_OAUTH_REFRESH_TOKEN,token_uri="https://oauth2.googleapis.com/token",client_id=DRIVE_OAUTH_CLIENT_ID,client_secret=DRIVE_OAUTH_CLIENT_SECRET,scopes=scopes)
+    return UserCreds(token=None,refresh_token=DRIVE_OAUTH_REFRESH_TOKEN,token_uri="https://oauth2.googleapis.com/token",client_id=DRIVE_OAUTH_CLIENT_ID,client_secret=DRIVE_OAUTH_CLIENT_SECRET,scopes=SCOPES_USER)
 
 def sa_creds(scopes):
     path=os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if not path: fail("MISSING_SA","GOOGLE_APPLICATION_CREDENTIALS not set")
     return SACreds.from_service_account_file(path,scopes=scopes)
 
-def build_sheets_user(): return build("sheets","v4",credentials=user_creds(["https://www.googleapis.com/auth/spreadsheets"]),cache_discovery=False)
+def build_sheets_user(): return build("sheets","v4",credentials=user_creds(),cache_discovery=False)
 def build_sheets_sa(): return build("sheets","v4",credentials=sa_creds(["https://www.googleapis.com/auth/spreadsheets.readonly"]),cache_discovery=False)
-def build_drive_user(): return build("drive","v3",credentials=user_creds(["https://www.googleapis.com/auth/drive"]),cache_discovery=False)
+def build_drive_user(): return build("drive","v3",credentials=user_creds(),cache_discovery=False)
 
 def parse_http(e:HttpError):
     try: s=getattr(e.resp,"status",None)
@@ -282,8 +285,9 @@ def fmt_baku(iso_str):
     return dt_loc.strftime("%d.%m.%Y %H:%M:%S")
 
 HEADERS=["videoId","playlistId","channelTitle","publishedAt","title","duration_s","isShorts","viewCount","likeCount","commentCount","categoryId","defaultLanguage","topicCategories_ru","hasPaidProductPlacement","firstSeenAt","lastUpdatedAt","isTombstoned","tombstoneReason"]
+INDEX_HEADERS=["playlistId","docId","docName","lastScanAt","rowsInDoc"]
 
-def ensure_tab(spreadsheet_id,tab_name="videos"):
+def ensure_tab(spreadsheet_id,tab_name):
     svc=build_sheets_user()
     meta=svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     sheets=meta.get("sheets",[])
@@ -305,9 +309,27 @@ def ensure_header(spreadsheet_id,tab_name="videos"):
     if len(cur)<len(need) or cur[:len(need)]!=need:
         sheets_values_batch_update_user(spreadsheet_id,[{"range":a1(tab_name,"A1:R1"),"values":[need]}])
 
+def ensure_index_sheet():
+    name="VideosIndex"
+    fid=drive_find_file_by_name(name,CHUNKS_FOLDER_ID)
+    if not fid:
+        fid=drive_create_sheet_in_folder(name,CHUNKS_FOLDER_ID)
+    ensure_tab(fid,"index")
+    vals=sheets_values_get_user(fid,a1("index","1:1"))
+    if not vals or not vals[0]:
+        sheets_values_batch_update_user(fid,[{"range":a1("index","A1:E1"),"values":[INDEX_HEADERS]}])
+    return fid
+
 def read_existing_video_ids(spreadsheet_id,tab_name="videos"):
     out={}
     col=sheets_values_get_user(spreadsheet_id,a1(tab_name,"A2:A"))
+    for i,row in enumerate(col,start=2):
+        if row and row[0]: out[row[0]]=i
+    return out
+
+def read_index_map(index_id):
+    out={}
+    col=sheets_values_get_user(index_id,a1("index","A2:A"))
     for i,row in enumerate(col,start=2):
         if row and row[0]: out[row[0]]=i
     return out
@@ -321,6 +343,23 @@ def batch_update_rows(spreadsheet_id,updates):
 
 def append_rows(spreadsheet_id,rows):
     if rows: sheets_values_append_user(spreadsheet_id,a1("videos","A1"),rows)
+
+def update_index(index_id,items):
+    now=dt.datetime.now(BAKU_TZ).strftime("%d.%m.%Y %H:%M:%S")
+    existing=read_index_map(index_id)
+    updates=[]; appends=[]
+    for it in items:
+        row=[it["playlistId"],it["docId"],it["docName"],now,str(it.get("rowsInDoc",""))]
+        if it["playlistId"] in existing:
+            idx=existing[it["playlistId"]]
+            updates.append((idx,row))
+        else:
+            appends.append(row)
+    data=[]
+    for row_idx,vals in updates:
+        data.append({"range":a1("index",f"A{row_idx}:E{row_idx}"),"values":[vals]})
+    if data: sheets_values_batch_update_user(index_id,data)
+    if appends: sheets_values_append_user(index_id,a1("index","A1"),appends)
 
 def load_state():
     name="chunks_state.json"
@@ -343,12 +382,12 @@ def pick_doc_for_playlist(st,playlist_id):
             st["playlist_to_doc"][playlist_id]=d["id"]; return d["id"]
     name=f"VideosChunk_{len(st['docs'])+1:04d}"
     sid=drive_create_sheet_in_folder(name,CHUNKS_FOLDER_ID)
-    st["docs"].append({"id":sid,"name":name,"rows":1})
+    st["docs"].append({"id":sid,"name":name,"rows":0})
     ensure_header(sid)
     st["playlist_to_doc"][playlist_id]=sid
     return sid
 
-def process_playlist(st,playlist_id,channel_title,since_iso,topic_ru_map):
+def process_playlist(st,playlist_id,channel_title,since_iso,topic_ru_map,index_id):
     vid_ids=list_since(playlist_id,since_iso,1001)
     if not vid_ids:
         print(f"SKIP[ANNUAL_LIMIT_OR_EMPTY]: {playlist_id}")
@@ -385,6 +424,10 @@ def process_playlist(st,playlist_id,channel_title,since_iso,topic_ru_map):
                 if d["id"]==doc_id:
                     d["rows"]=d.get("rows",0)+1
                     break
+    doc_name=""
+    for d in st["docs"]:
+        if d["id"]==doc_id: doc_name=d.get("name",""); break
+    update_index(index_id,[{"playlistId":playlist_id,"docId":doc_id,"docName":doc_name,"rowsInDoc":next((d.get("rows",0) for d in st["docs"] if d["id"]==doc_id),0)}])
     print(f"DONE[PLAYLIST]: {playlist_id} up={len(updates)} add={len(appends)}")
 
 def main():
@@ -403,11 +446,12 @@ def main():
     if not allowed: fail("NO_INPUT","no playlists after filter")
     since_iso=(dt.datetime.utcnow()-dt.timedelta(days=WINDOW_DAYS)).replace(microsecond=0).isoformat()+"Z"
     st=load_state()
+    index_id=ensure_index_sheet()
     title_map={}
     for pid,t in zip(uploads,titles):
         if pid: title_map[pid]=t
     for pid in allowed:
-        process_playlist(st,pid,title_map.get(pid,""),since_iso,topic_ru_map)
+        process_playlist(st,pid,title_map.get(pid,""),since_iso,topic_ru_map,index_id)
         time.sleep(0.2)
     save_state(st)
 
