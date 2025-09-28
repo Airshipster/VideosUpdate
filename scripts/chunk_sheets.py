@@ -26,7 +26,6 @@ SHORTS_LIMIT=182
 SESSION=requests.Session()
 YOUTUBE_ENDPOINT="https://www.googleapis.com/youtube/v3"
 KEY_IDX=0
-
 SCOPES_USER=["https://www.googleapis.com/auth/drive","https://www.googleapis.com/auth/spreadsheets"]
 
 def fail(code,msg,ec=2):
@@ -67,7 +66,7 @@ def sheets_get_values_sa(rng):
         return svc.spreadsheets().values().get(spreadsheetId=SOURCE_SHEET_ID,range=rng).execute().get("values",[])
     except HttpError as e:
         s,m=parse_http(e); fail("SHEETS_SA",f"{s} {rng} {m}")
-    except Exception: fail("SHEETS_SA","unexpected")
+    except Exception as e: fail("SHEETS_SA",f"ex:{type(e).__name__} {str(e)[:200]}")
 
 def sheets_values_get_user(spreadsheet_id,rng):
     try:
@@ -75,7 +74,7 @@ def sheets_values_get_user(spreadsheet_id,rng):
         return svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id,range=rng).execute().get("values",[])
     except HttpError as e:
         s,m=parse_http(e); fail("SHEETS_USER_GET",f"{s} {spreadsheet_id} {rng} {m}")
-    except Exception: fail("SHEETS_USER_GET","unexpected")
+    except Exception as e: fail("SHEETS_USER_GET",f"ex:{type(e).__name__} {str(e)[:200]}")
 
 def sheets_values_batch_update_user(spreadsheet_id,data,value_input_option="RAW"):
     try:
@@ -84,7 +83,7 @@ def sheets_values_batch_update_user(spreadsheet_id,data,value_input_option="RAW"
         return svc.spreadsheets().values().batchUpdate(spreadsheetId=spreadsheet_id,body=body).execute()
     except HttpError as e:
         s,m=parse_http(e); fail("SHEETS_USER_WRITE",f"{s} {spreadsheet_id} {m}")
-    except Exception: fail("SHEETS_USER_WRITE","unexpected")
+    except Exception as e: fail("SHEETS_USER_WRITE",f"ex:{type(e).__name__} {str(e)[:200]}")
 
 def sheets_values_append_user(spreadsheet_id,rng,values):
     try:
@@ -93,7 +92,7 @@ def sheets_values_append_user(spreadsheet_id,rng,values):
         return svc.spreadsheets().values().append(spreadsheetId=spreadsheet_id,range=rng,valueInputOption="RAW",insertDataOption="INSERT_ROWS",body=body).execute()
     except HttpError as e:
         s,m=parse_http(e); fail("SHEETS_USER_APPEND",f"{s} {spreadsheet_id} {m}")
-    except Exception: fail("SHEETS_USER_APPEND","unexpected")
+    except Exception as e: fail("SHEETS_USER_APPEND",f"ex:{type(e).__name__} {str(e)[:200]}")
 
 def drive_create_sheet_in_folder(name,folder_id):
     try:
@@ -103,7 +102,7 @@ def drive_create_sheet_in_folder(name,folder_id):
         return f["id"]
     except HttpError as e:
         s,m=parse_http(e); fail("DRIVE_CREATE",f"{s} {m}")
-    except Exception: fail("DRIVE_CREATE","unexpected")
+    except Exception as e: fail("DRIVE_CREATE",f"ex:{type(e).__name__} {str(e)[:200]}")
 
 def drive_find_file_by_name(name,folder_id):
     try:
@@ -114,7 +113,8 @@ def drive_find_file_by_name(name,folder_id):
         return files[0]["id"] if files else None
     except HttpError as e:
         s,m=parse_http(e); fail("DRIVE_SEARCH",f"{s} {m}")
-    except Exception: fail("DRIVE_SEARCH","unexpected")
+    except Exception as e:
+        fail("DRIVE_SEARCH",f"ex:{type(e).__name__} {str(e)[:200]}")
 
 def drive_download_text(file_id):
     try:
@@ -130,7 +130,7 @@ def drive_download_text(file_id):
         return buf.read().decode("utf-8")
     except HttpError as e:
         s,m=parse_http(e); fail("DRIVE_READ",f"{s} {m}")
-    except Exception: fail("DRIVE_READ","unexpected")
+    except Exception as e: fail("DRIVE_READ",f"ex:{type(e).__name__} {str(e)[:200]}")
 
 def drive_overwrite_text(name,folder_id,text):
     try:
@@ -144,7 +144,19 @@ def drive_overwrite_text(name,folder_id,text):
         return f["id"]
     except HttpError as e:
         s,m=parse_http(e); fail("DRIVE_WRITE",f"{s} {m}")
-    except Exception: fail("DRIVE_WRITE","unexpected")
+    except Exception as e: fail("DRIVE_WRITE",f"ex:{type(e).__name__} {str(e)[:200]}")
+
+def drive_validate_folder(folder_id):
+    try:
+        svc=build_drive_user()
+        meta=svc.files().get(fileId=folder_id,fields="id,name,mimeType,trashed,driveId,permissions",supportsAllDrives=True).execute()
+        if meta.get("trashed"): fail("DRIVE_FOLDER","folder is trashed")
+        if meta.get("mimeType")!="application/vnd.google-apps.folder": fail("DRIVE_FOLDER","not a folder id")
+        return meta.get("name","")
+    except HttpError as e:
+        s,m=parse_http(e); fail("DRIVE_FOLDER",f"{s} {m}")
+    except Exception as e:
+        fail("DRIVE_FOLDER",f"ex:{type(e).__name__} {str(e)[:200]}")
 
 def get_helper_maps():
     vals=sheets_get_values_sa(a1(MAP_SHEET_TAB,"A:H"))
@@ -434,6 +446,7 @@ def main():
     if not API_KEYS: fail("MISSING","YOUTUBE_API_KEYS")
     if not SOURCE_SHEET_ID or not SOURCE_SHEET_TAB or not MAP_SHEET_TAB: fail("MISSING","SOURCE_SHEET_*")
     if not CHUNKS_FOLDER_ID: fail("MISSING","CHUNKS_FOLDER_ID")
+    drive_validate_folder(CHUNKS_FOLDER_ID)
     header_map,topic_ru_map=get_helper_maps()
     uploads,vcounts,topics,titles=get_baza_columns(header_map)
     allowed=[]
