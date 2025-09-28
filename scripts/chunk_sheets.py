@@ -1,11 +1,13 @@
 import os, sys, json, time, re, io
 import datetime as dt
 from dateutil import tz
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 import requests
 import pandas as pd
 from google.oauth2.service_account import Credentials as SACreds
 from google.oauth2.credentials import Credentials as UserCreds
+from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -16,6 +18,7 @@ MAP_SHEET_TAB=os.getenv("MAP_SHEET_TAB","").strip()
 CHUNKS_FOLDER_ID=os.getenv("CHUNKS_FOLDER_ID","").strip()
 PLAYLIST_LIMIT=int(os.getenv("PLAYLIST_LIMIT","5") or "5")
 ROWS_PER_DOC=int(os.getenv("ROWS_PER_DOC","20000") or "20000")
+
 DRIVE_OAUTH_CLIENT_ID=os.getenv("DRIVE_OAUTH_CLIENT_ID","").strip()
 DRIVE_OAUTH_CLIENT_SECRET=os.getenv("DRIVE_OAUTH_CLIENT_SECRET","").strip()
 DRIVE_OAUTH_REFRESH_TOKEN=os.getenv("DRIVE_OAUTH_REFRESH_TOKEN","").strip()
@@ -32,15 +35,38 @@ def fail(code,msg,ec=2):
     print(f"ERROR[{code}]: {msg}")
     sys.exit(ec)
 
+def mask(s):
+    if not s: return ""
+    if len(s)<=8: return s[0:2]+"*"*(len(s)-4)+s[-2:]
+    return s[0:4]+"*"*(len(s)-8)+s[-4:]
+
 def user_creds():
     if not (DRIVE_OAUTH_CLIENT_ID and DRIVE_OAUTH_CLIENT_SECRET and DRIVE_OAUTH_REFRESH_TOKEN):
-        fail("MISSING_OAUTH","drive oauth secrets missing")
-    return UserCreds(token=None,refresh_token=DRIVE_OAUTH_REFRESH_TOKEN,token_uri="https://oauth2.googleapis.com/token",client_id=DRIVE_OAUTH_CLIENT_ID,client_secret=DRIVE_OAUTH_CLIENT_SECRET,scopes=SCOPES_USER)
+        fail("MISSING_OAUTH","one of DRIVE_OAUTH_CLIENT_ID/SECRET/REFRESH_TOKEN is empty")
+    creds=UserCreds(token=None,refresh_token=DRIVE_OAUTH_REFRESH_TOKEN,token_uri="https://oauth2.googleapis.com/token",
+                    client_id=DRIVE_OAUTH_CLIENT_ID,client_secret=DRIVE_OAUTH_CLIENT_SECRET,scopes=SCOPES_USER)
+    try:
+        creds.refresh(Request())
+    except RefreshError as e:
+        msg=str(e)
+        hints=[]
+        hints.append("check: OAuth consent screen status — if Testing, refresh tokens expire in 7 days")
+        hints.append("fix: re-issue refresh token in OAuth Playground with BOTH scopes: drive + spreadsheets")
+        hints.append("check: refresh token must match CURRENT client secret (if secret was reset, old token breaks)")
+        hints.append("check: same OAuth project as your Client ID in secrets; APIs enabled (Drive + Sheets)")
+        diag=f"invalid OAuth refresh: client_id={mask(DRIVE_OAUTH_CLIENT_ID)}, secret={mask(DRIVE_OAUTH_CLIENT_SECRET)}, token={mask(DRIVE_OAUTH_REFRESH_TOKEN)}; reason={msg}"
+        fail("OAUTH_REFRESH", diag+"\n"+"\n".join(" - "+h for h in hints))
+    except Exception as e:
+        fail("OAUTH_PRECHECK", f"{type(e).__name__}: {str(e)[:200]}")
+    return creds
 
 def sa_creds(scopes):
     path=os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if not path: fail("MISSING_SA","GOOGLE_APPLICATION_CREDENTIALS not set")
-    return SACreds.from_service_account_file(path,scopes=scopes)
+    try:
+        return SACreds.from_service_account_file(path,scopes=scopes)
+    except Exception as e:
+        fail("SA_PARSE", f"{type(e).__name__}: {str(e)[:200]}")
 
 def build_sheets_user(): return build("sheets","v4",credentials=user_creds(),cache_discovery=False)
 def build_sheets_sa(): return build("sheets","v4",credentials=sa_creds(["https://www.googleapis.com/auth/spreadsheets.readonly"]),cache_discovery=False)
@@ -66,7 +92,7 @@ def sheets_get_values_sa(rng):
         return svc.spreadsheets().values().get(spreadsheetId=SOURCE_SHEET_ID,range=rng).execute().get("values",[])
     except HttpError as e:
         s,m=parse_http(e); fail("SHEETS_SA",f"{s} {rng} {m}")
-    except Exception as e: fail("SHEETS_SA",f"ex:{type(e).__name__} {str(e)[:200]}")
+    except Exception as e: fail("SHEETS_SA",f"{type(e).__name__}: {str(e)[:200]}")
 
 def sheets_values_get_user(spreadsheet_id,rng):
     try:
@@ -74,7 +100,7 @@ def sheets_values_get_user(spreadsheet_id,rng):
         return svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id,range=rng).execute().get("values",[])
     except HttpError as e:
         s,m=parse_http(e); fail("SHEETS_USER_GET",f"{s} {spreadsheet_id} {rng} {m}")
-    except Exception as e: fail("SHEETS_USER_GET",f"ex:{type(e).__name__} {str(e)[:200]}")
+    except Exception as e: fail("SHEETS_USER_GET",f"{type(e).__name__}: {str(e)[:200]}")
 
 def sheets_values_batch_update_user(spreadsheet_id,data,value_input_option="RAW"):
     try:
@@ -83,7 +109,7 @@ def sheets_values_batch_update_user(spreadsheet_id,data,value_input_option="RAW"
         return svc.spreadsheets().values().batchUpdate(spreadsheetId=spreadsheet_id,body=body).execute()
     except HttpError as e:
         s,m=parse_http(e); fail("SHEETS_USER_WRITE",f"{s} {spreadsheet_id} {m}")
-    except Exception as e: fail("SHEETS_USER_WRITE",f"ex:{type(e).__name__} {str(e)[:200]}")
+    except Exception as e: fail("SHEETS_USER_WRITE",f"{type(e).__name__}: {str(e)[:200]}")
 
 def sheets_values_append_user(spreadsheet_id,rng,values):
     try:
@@ -92,7 +118,7 @@ def sheets_values_append_user(spreadsheet_id,rng,values):
         return svc.spreadsheets().values().append(spreadsheetId=spreadsheet_id,range=rng,valueInputOption="RAW",insertDataOption="INSERT_ROWS",body=body).execute()
     except HttpError as e:
         s,m=parse_http(e); fail("SHEETS_USER_APPEND",f"{s} {spreadsheet_id} {m}")
-    except Exception as e: fail("SHEETS_USER_APPEND",f"ex:{type(e).__name__} {str(e)[:200]}")
+    except Exception as e: fail("SHEETS_USER_APPEND",f"{type(e).__name__}: {str(e)[:200]}")
 
 def drive_create_sheet_in_folder(name,folder_id):
     try:
@@ -102,7 +128,7 @@ def drive_create_sheet_in_folder(name,folder_id):
         return f["id"]
     except HttpError as e:
         s,m=parse_http(e); fail("DRIVE_CREATE",f"{s} {m}")
-    except Exception as e: fail("DRIVE_CREATE",f"ex:{type(e).__name__} {str(e)[:200]}")
+    except Exception as e: fail("DRIVE_CREATE",f"{type(e).__name__}: {str(e)[:200]}")
 
 def drive_find_file_by_name(name,folder_id):
     try:
@@ -114,7 +140,7 @@ def drive_find_file_by_name(name,folder_id):
     except HttpError as e:
         s,m=parse_http(e); fail("DRIVE_SEARCH",f"{s} {m}")
     except Exception as e:
-        fail("DRIVE_SEARCH",f"ex:{type(e).__name__} {str(e)[:200]}")
+        fail("DRIVE_SEARCH",f"{type(e).__name__}: {str(e)[:200]}")
 
 def drive_download_text(file_id):
     try:
@@ -130,7 +156,7 @@ def drive_download_text(file_id):
         return buf.read().decode("utf-8")
     except HttpError as e:
         s,m=parse_http(e); fail("DRIVE_READ",f"{s} {m}")
-    except Exception as e: fail("DRIVE_READ",f"ex:{type(e).__name__} {str(e)[:200]}")
+    except Exception as e: fail("DRIVE_READ",f"{type(e).__name__}: {str(e)[:200]}")
 
 def drive_overwrite_text(name,folder_id,text):
     try:
@@ -144,19 +170,23 @@ def drive_overwrite_text(name,folder_id,text):
         return f["id"]
     except HttpError as e:
         s,m=parse_http(e); fail("DRIVE_WRITE",f"{s} {m}")
-    except Exception as e: fail("DRIVE_WRITE",f"ex:{type(e).__name__} {str(e)[:200]}")
+    except Exception as e: fail("DRIVE_WRITE",f"{type(e).__name__}: {str(e)[:200]}")
 
 def drive_validate_folder(folder_id):
     try:
         svc=build_drive_user()
-        meta=svc.files().get(fileId=folder_id,fields="id,name,mimeType,trashed,driveId,permissions",supportsAllDrives=True).execute()
+        meta=svc.files().get(fileId=folder_id,fields="id,name,mimeType,trashed,driveId",supportsAllDrives=True).execute()
         if meta.get("trashed"): fail("DRIVE_FOLDER","folder is trashed")
         if meta.get("mimeType")!="application/vnd.google-apps.folder": fail("DRIVE_FOLDER","not a folder id")
         return meta.get("name","")
     except HttpError as e:
         s,m=parse_http(e); fail("DRIVE_FOLDER",f"{s} {m}")
     except Exception as e:
-        fail("DRIVE_FOLDER",f"ex:{type(e).__name__} {str(e)[:200]}")
+        fail("DRIVE_FOLDER",f"{type(e).__name__}: {str(e)[:200]}")
+
+def a1(sheet,rng):
+    if not (sheet.startswith("'") and sheet.endswith("'")): sheet=f"'{sheet}'"
+    return f"{sheet}!{rng}"
 
 def get_helper_maps():
     vals=sheets_get_values_sa(a1(MAP_SHEET_TAB,"A:H"))
@@ -441,6 +471,18 @@ def process_playlist(st,playlist_id,channel_title,since_iso,topic_ru_map,index_i
         if d["id"]==doc_id: doc_name=d.get("name",""); break
     update_index(index_id,[{"playlistId":playlist_id,"docId":doc_id,"docName":doc_name,"rowsInDoc":next((d.get("rows",0) for d in st["docs"] if d["id"]==doc_id),0)}])
     print(f"DONE[PLAYLIST]: {playlist_id} up={len(updates)} add={len(appends)}")
+
+def drive_validate_folder(folder_id):
+    svc=build_drive_user()
+    try:
+        meta=svc.files().get(fileId=folder_id,fields="id,name,mimeType,trashed,driveId",supportsAllDrives=True).execute()
+    except HttpError as e:
+        s,m=parse_http(e); fail("DRIVE_FOLDER",f"{s} {m}")
+    except Exception as e:
+        fail("DRIVE_FOLDER",f"{type(e).__name__}: {str(e)[:200]}")
+    if meta.get("trashed"): fail("DRIVE_FOLDER","folder is trashed")
+    if meta.get("mimeType")!="application/vnd.google-apps.folder": fail("DRIVE_FOLDER","not a folder id")
+    return meta.get("name","")
 
 def main():
     if not API_KEYS: fail("MISSING","YOUTUBE_API_KEYS")
