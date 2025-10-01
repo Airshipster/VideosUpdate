@@ -1,66 +1,51 @@
-import os, json, sys, requests
+# scripts/oauth_probe.py
+# Small diagnostic to confirm the OAuth refresh token works and Drive/Sheets are reachable.
 
-def getenv(name):
-    v = os.getenv(name, "").strip()
-    if not v:
-        print(f"ERROR[SECRET_MISSING]: {name} is empty")
+import sys, json
+from googleapiclient.errors import HttpError
+from oauth_helper import build_drive_service, build_sheets_service
+
+def main():
+    # 1) Try exchanging refresh->access implicitly by building clients
+    print("OAUTH_PROBE: requesting access_token via refresh_token (no scope)...")
+    try:
+        # Build services (this performs a refresh under the hood)
+        drive = build_drive_service()
+        sheets = build_sheets_service()
+        print("OAUTH_PROBE: status = 200")
+    except HttpError as e:
+        try:
+            body = e.content.decode() if isinstance(e.content, bytes) else (e.content or "")
+        except Exception:
+            body = str(e)
+        print("OAUTH_PROBE: ERROR", getattr(e.resp, "status", None), body[:400])
         sys.exit(2)
-    return v
+    except Exception as e:
+        print("OAUTH_PROBE: ERROR", type(e).__name__, str(e)[:400])
+        sys.exit(2)
 
-cid = getenv("DRIVE_OAUTH_CLIENT_ID")
-csec = getenv("DRIVE_OAUTH_CLIENT_SECRET")
-rtok = getenv("DRIVE_OAUTH_REFRESH_TOKEN")
+    # 2) Call a harmless Drive endpoint to verify scope drive.file or drive
+    try:
+        about = drive.about().get(fields="user,storageQuota").execute()
+        print("DRIVE about.get status = 200")
+        # Trim noisy fields before printing
+        safe = {
+            "user": {
+                "kind": about.get("user", {}).get("kind"),
+                "displayName": about.get("user", {}).get("displayName"),
+                "photoLink": about.get("user", {}).get("photoLink"),
+                "me": about.get("user", {}).get("me"),
+                "permissionId": about.get("user", {}).get("permissionId"),
+                "emailAddress": about.get("user", {}).get("emailAddress"),
+            },
+            "storageQuota": about.get("storageQuota"),
+        }
+        print("DRIVE about.get =", json.dumps(safe, ensure_ascii=False, indent=2))
+    except HttpError as e:
+        print("DRIVE about.get ERROR", getattr(e.resp, "status", None))
+        sys.exit(2)
 
-token_url = "https://oauth2.googleapis.com/token"
-data = {
-    "client_id": cid,
-    "client_secret": csec,
-    "refresh_token": rtok,
-    "grant_type": "refresh_token",
-}
+    print("OAUTH_PROBE: OK")
 
-print("OAUTH_PROBE: requesting access_token via refresh_token (no scope)...")
-r = requests.post(token_url, data=data, timeout=30)
-
-def mask(s, keep=6):
-    if not s: return s
-    if len(s) <= keep: return "*"*len(s)
-    return s[:keep] + "*"*(len(s)-keep)
-
-print("OAUTH_PROBE: status =", r.status_code)
-try:
-    j = r.json()
-except Exception:
-    print("OAUTH_PROBE: raw =", r.text[:4000])
-    sys.exit(2)
-
-safe = dict(j)
-if "access_token" in safe: safe["access_token"] = mask(safe["access_token"], 12)
-if "refresh_token" in safe: safe["refresh_token"] = mask(safe["refresh_token"], 8)
-print("OAUTH_PROBE: body =", json.dumps(safe, ensure_ascii=False, indent=2))
-
-if r.status_code != 200:
-    err = safe.get("error")
-    desc = safe.get("error_description")
-    if err == "invalid_scope":
-        print("HINT: refresh-токен выписан с другими scope или клиент/секрет не совпадает с тем, чем он был выдан.")
-        print("HINT: перевыпусти токен в OAuth Playground c ОДНИМИ запроса́ми одновременно:")
-        print("      https://www.googleapis.com/auth/drive.file  И  https://www.googleapis.com/auth/spreadsheets")
-        print("      и обязательно используй Web Client с редиректом https://developers.google.com/oauthplayground")
-    sys.exit(2)
-
-atk = j.get("access_token")
-sc = j.get("scope")
-print("OAUTH_PROBE: granted scopes =", sc)
-
-headers = {"Authorization": f"Bearer {atk}"}
-about = requests.get("https://www.googleapis.com/drive/v3/about?fields=user,storageQuota", headers=headers, timeout=30)
-print("DRIVE about.get status =", about.status_code)
-try:
-    ab = about.json()
-except Exception:
-    print("DRIVE about.get raw =", about.text[:2000])
-    sys.exit(2)
-
-print("DRIVE about.get =", json.dumps(ab, ensure_ascii=False, indent=2))
-print("OAUTH_PROBE: OK")
+if __name__ == "__main__":
+    main()
